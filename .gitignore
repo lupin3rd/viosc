@@ -11,6 +11,9 @@ dist/
 venv/
 env/
 
+# Tests (not shipped)
+tests/
+
 # Editors / OS
 *.swp
 *.swo

@@ -65,6 +65,10 @@ monitor_misses = {}
 MONITOR_MAX_MISSES = 3  
 THUMB_MAX_CONCURRENCY = 3
 thumb_semaphore = threading.BoundedSemaphore(THUMB_MAX_CONCURRENCY)
+# e10s02: up to 3 thumbs per media at distinct jittered anchors (~15/50/85 % of duration).
+THUMB_MAX_COUNT = 3
+THUMB_TARGET_ANCHORS = (0.15, 0.5, 0.85)
+THUMB_JITTER = 0.05  # ±5 % of duration around each anchor
 
 def create_empty_vimix_entry():
     entry = {prop: None for prop in SUPPORTED_PROPERTIES}
@@ -108,38 +112,65 @@ def extract_single_frame(file_path, timestamp_sec, width=320, height=180):
     ]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode == 0 and len(result.stdout) > 100:
-            return result.stdout
-        return None
+        if result.returncode != 0:
+            print(f"{COLOR_RESET_EV}[THUMBNAIL ERROR]{COLOR_RESET} ffmpeg failed "
+                  f"(exit {result.returncode}) for '{file_path}'")
+            return None
+        if len(result.stdout) <= 100:
+            print(f"{COLOR_RESET_EV}[THUMBNAIL ERROR]{COLOR_RESET} empty frame for '{file_path}'")
+            return None
+        return result.stdout
     except Exception as e:
         print(f"{COLOR_RESET_EV}[THUMBNAIL ERROR]{COLOR_RESET} Unable to extract frame: {e}")
         return None
 
-def extract_thumbnails_from_file(file_path, count=1, width=320, height=180):
-    duration = get_video_duration(file_path)
-    thumbnails = []
-    if duration <= 0:
-        frame = extract_single_frame(file_path, timestamp_sec=0, width=width, height=height)
-        if frame: thumbnails.append(frame)
-        return thumbnails
+def thumb_target_times(duration, count=THUMB_MAX_COUNT):
+    """Distinct jittered seek targets for a media of the given duration (seconds).
 
-    target_time = random.uniform(0.1, 0.9) * duration
-    frame = extract_single_frame(file_path, timestamp_sec=target_time, width=width, height=height)
-    if frame: thumbnails.append(frame)
+    Images (duration <= 0) yield a single target at t=0. Very short clips collapse
+    to as many distinct targets as possible (min 1) so frames are never duplicated.
+    """
+    if duration <= 0:
+        return [0.0]
+    count = max(1, min(int(count), THUMB_MAX_COUNT))
+    times = []
+    for anchor in THUMB_TARGET_ANCHORS[:count]:
+        t = anchor * duration + random.uniform(-THUMB_JITTER, THUMB_JITTER) * duration
+        times.append(max(0.0, min(t, duration * 0.98)))
+    seen, distinct = set(), []
+    for t in times:
+        key = round(t, 1)
+        if key not in seen:
+            seen.add(key)
+            distinct.append(t)
+    return distinct or [0.0]
+
+
+def extract_thumbnails_from_file(file_path, count=1, width=320, height=180):
+    thumbnails = []
+    duration = get_video_duration(file_path)
+    for timestamp_sec in thumb_target_times(duration, count):
+        frame = extract_single_frame(file_path, timestamp_sec=timestamp_sec, width=width, height=height)
+        if frame:
+            thumbnails.append(frame)
     return thumbnails
 
 def generate_thumbnails_worker(idx, uri_value):
     file_path = clean_uri_path(uri_value)
     if not os.path.exists(file_path):
-        if idx in vimix_data: vimix_data[idx]["thumbnails"] = []
-        return
+        print(f"{COLOR_RESET_EV}[THUMBNAIL ERROR]{COLOR_RESET} File not found: '{file_path}'")
+        return  # keep the previous cache (if any); new sources stay empty
 
     with thumb_semaphore:
-        thumbnails = extract_thumbnails_from_file(file_path, count=1)
+        thumbnails = extract_thumbnails_from_file(file_path, count=THUMB_MAX_COUNT)
     if idx in vimix_data:
-        vimix_data[idx]["thumbnails"] = thumbnails
-        if LOG_LEVEL >= 1:
-            print(f"{COLOR_THUMB}[THUMB READY]{COLOR_RESET} Index {idx}: generated 1 random thumbnail for '{os.path.basename(file_path)}'")
+        if thumbnails:
+            vimix_data[idx]["thumbnails"] = thumbnails
+            if LOG_LEVEL >= 1:
+                print(f"{COLOR_THUMB}[THUMB READY]{COLOR_RESET} Index {idx}: generated {len(thumbnails)} random thumbnail(s) for '{os.path.basename(file_path)}'")
+        else:
+            print(f"{COLOR_RESET_EV}[THUMBNAIL ERROR]{COLOR_RESET} no frames extracted from '{file_path}'")
+            # keep the previous cache; a failed run must not wipe a good thumbnail
 
 def broadcast_vimix_state():
     safe_data = {idx: {k: v for k, v in data.items() if k != "thumbnails"} for idx, data in vimix_data.items()}
@@ -179,9 +210,19 @@ def prune_stale_sources(round_id):
 def send_thumbnail_blob(target_identifier, thumb_arg):
     idx = int(target_identifier) if str(target_identifier).isdigit() else find_index_by_name(str(target_identifier))
     if idx is None or idx not in vimix_data: return
-    
+
     thumbnails = vimix_data[idx].get("thumbnails", [])
-    if not thumbnails: return
+    if not thumbnails:
+        # e10s01: an empty cache with a valid URI self-heals on demand instead of
+        # silently dropping the request. Unloadable sources (no URI / file still
+        # missing) keep the silent no-op.
+        uri_value = vimix_data[idx].get("uri")
+        if not uri_value:
+            return
+        generate_thumbnails_worker(idx, uri_value)
+        thumbnails = vimix_data[idx].get("thumbnails", [])
+        if not thumbnails:
+            return
 
     arg_str = str(thumb_arg).lower().strip()
     if arg_str == "all": indices_to_send = list(range(len(thumbnails)))
@@ -316,7 +357,9 @@ def create_osc_handler(server_port):
             if idx is not None and idx in vimix_data:
                 uri_val = vimix_data[idx].get("uri")
                 if uri_val:
-                    vimix_data[idx]["thumbnails"] = []
+                    # e10s01: do NOT wipe the cache before regenerating — the
+                    # worker replaces it only on success, so a failed regen keeps
+                    # the previous good thumbnail.
                     threading.Thread(target=generate_thumbnails_worker, args=(idx, uri_val), daemon=True).start()
         elif clean_address.startswith("viosc/sync/"): process_dynamic_sync_request(clean_address, args)
         elif clean_address.startswith("viosc/monitor/"):
