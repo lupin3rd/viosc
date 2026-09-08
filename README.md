@@ -58,6 +58,30 @@ viOSC runs two UDP servers and one client:
 
 At start-up viOSC verifies that `python-osc` is importable and that the `ffmpeg` / `ffprobe` executables are reachable, and exits with a clear error if any is missing.
 
+> **AppImage:** from v0.3.0 a single-file AppImage is available that bundles
+> CPython, python-osc, the tkinter GUI and a **static GPL ffmpeg/ffprobe**, so
+> no Python or ffmpeg install is needed. Pre-built AppImages are attached to
+> the [GitHub Releases](https://github.com/lupin3rd/viosc/releases).
+
+---
+
+## GUI
+
+Since v0.3.0 viOSC opens a **minimal GUI window** by default (config fields +
+live log with timestamps + Vimix status + "Apply & restart"). The window is
+configured, logged and versioned there; nothing is printed to the terminal in
+GUI mode. Run `python viosc.py --headless` for the console daemon behaviour.
+
+## Releases
+
+Pre-built AppImages live on the [Releases](https://github.com/lupin3rd/viosc/releases)
+page — one file carries everything: CPython 3.13, python-osc, the tkinter
+GUI and a **static GPL-licensed ffmpeg/ffprobe** (invoked via subprocess, so
+viOSC's own MIT license is not affected — same boundary as installing ffmpeg
+with apt). Run the AppImage like the source version: GUI by default,
+`--headless` for the console daemon. Settings live in
+`~/.config/viosc/config.json`.
+
 ---
 
 ## Installation

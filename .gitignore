@@ -11,8 +11,11 @@ dist/
 venv/
 env/
 
-# Tests (not shipped)
-tests/
+# Tooling / build caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.appimage-cache/
 
 # Editors / OS
 *.swp
