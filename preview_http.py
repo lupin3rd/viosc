@@ -1,18 +1,19 @@
-"""HTTP preview surface for viosc (e38s01) — the A-side file transport.
+"""HTTP data-plane surface for viosc (e38s01, e41s03) — the A-side transport.
 
 Serves the media files that vimix media sources point to over HTTP with a
 correct RFC 7233 Range implementation (206 + Content-Range + Accept-Ranges,
 416 on bad ranges, 200 full without Range), plus an ffprobe-backed /meta
-endpoint. Sources are addressed by NAME through the daemon's live state table
-(address-by-name, like the OSC surface); a name that is not a media source
-(no uri) returns 404 and no path is ever opened from the request itself (no
-traversal surface).
+endpoint, plus (e41s03) one cached thumbnail frame per request. Sources are
+addressed by NAME through the daemon's live state table (address-by-name, like
+the OSC surface); a name that is not a media source (no uri) returns 404 and no
+path is ever opened from the request itself (no traversal surface).
 
 This module is deliberately free of ``import viosc``: the daemon runs as
 ``__main__`` and a by-name import would create a SECOND module copy with an
 empty state table (the classic __main__ double-import trap). Instead the
-caller injects its own live ``vimix_data`` table and probe function when the
-server starts, so resolution always sees the daemon's real state.
+caller injects its own live ``vimix_data`` table, probe function and thumbnail
+resolver when the server starts, so resolution always sees the daemon's real
+state.
 """
 
 import http.server
@@ -46,15 +47,20 @@ def resolve_media_path(name, vimix_data):
     return None
 
 
-def make_preview_handler(vimix_data, probe_meta):
+def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_state=None):
     """Build a handler class bound to the daemon's live state table and probe.
 
     ``probe_meta(path)`` must return the meta dict (or None); ``vimix_data``
     is the daemon's own mutable state object, so source churn is always seen.
+    ``resolve_thumb(name, index)`` returns one thumbnail frame's JPEG bytes or
+    None (e41s03) and ``provide_state()`` returns the state table as the exact
+    JSON text the OSC broadcast sends (e41s04): the daemon injects both for the
+    same reason it injects the probe — this module never imports viosc, so the
+    __main__ double-import trap cannot create a second, empty state table.
     """
 
     class BoundPreviewHandler(http.server.BaseHTTPRequestHandler):
-        """GET /preview/<source-name>/{file|meta} with RFC 7233 Range support."""
+        """GET /thumb/<name>/<index> and /preview/<name>/{file|meta}."""
 
         protocol_version = "HTTP/1.1"
 
@@ -64,6 +70,12 @@ def make_preview_handler(vimix_data, probe_meta):
         # -- routing -------------------------------------------------------
 
         def do_GET(self):
+            if self.path.startswith("/thumb/"):
+                self._serve_thumb()
+                return
+            if self.path.startswith("/state"):
+                self._serve_state()
+                return
             if not self.path.startswith("/preview/"):
                 self.send_error(404)
                 return
@@ -86,6 +98,48 @@ def make_preview_handler(vimix_data, probe_meta):
                 self._serve_file(path)
 
         # -- endpoints -----------------------------------------------------
+
+        def _serve_state(self):
+            """The state table as JSON, KEEPING the connection alive (e41s04).
+
+            The body comes from the daemon's provider, which is the same
+            serializer that feeds the OSC broadcast, so the two transports
+            cannot drift. Keep-alive is deliberate: a regular poll (typically
+            1 Hz) must not open a TCP connection every time — unlike the file
+            and thumbnail endpoints, whose responses are large and final.
+            """
+            if provide_state is None:
+                self.send_error(404)
+                return
+            body = provide_state().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _serve_thumb(self):
+            """One cached thumbnail frame as JPEG (e41s03).
+
+            Addressed by NAME through the injected resolver: no path is ever
+            built from the request, so an unknown name or a bad index is simply
+            a 404 and there is no traversal surface.
+            """
+            rest = self.path[len("/thumb/") :]
+            name, sep, raw_index = rest.partition("/")
+            if not sep or not raw_index.isdigit():
+                self.send_error(404)
+                return
+            blob = resolve_thumb(unquote(name), int(raw_index)) if resolve_thumb else None
+            if blob is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            self.close_connection = True
 
         def _serve_meta(self, path):
             meta = probe_meta(path)
@@ -167,9 +221,9 @@ def make_preview_handler(vimix_data, probe_meta):
     return BoundPreviewHandler
 
 
-def start_preview_server(ip, port, vimix_data, probe_meta):
+def start_preview_server(ip, port, vimix_data, probe_meta, resolve_thumb=None, provide_state=None):
     """Bind (and return) the preview HTTP server against the daemon's state."""
-    handler = make_preview_handler(vimix_data, probe_meta)
+    handler = make_preview_handler(vimix_data, probe_meta, resolve_thumb, provide_state)
 
     class PreviewServer(socketserver.ThreadingTCPServer):
         allow_reuse_address = True

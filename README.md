@@ -60,8 +60,7 @@ At start-up viOSC verifies that `python-osc` is importable and that the `ffmpeg`
 
 > **AppImage:** from v0.3.0 a single-file AppImage is available that bundles
 > CPython, python-osc, the tkinter GUI and a **static GPL ffmpeg/ffprobe**, so
-> no Python or ffmpeg install is needed. Pre-built AppImages are attached to
-> the [GitHub Releases](https://github.com/lupin3rd/viosc/releases).
+> no Python or ffmpeg install is needed (see [Packaging](#packaging)).
 
 ---
 
@@ -72,15 +71,20 @@ live log with timestamps + Vimix status + "Apply & restart"). The window is
 configured, logged and versioned there; nothing is printed to the terminal in
 GUI mode. Run `python viosc.py --headless` for the console daemon behaviour.
 
-## Releases
+## Packaging
 
-Pre-built AppImages live on the [Releases](https://github.com/lupin3rd/viosc/releases)
-page — one file carries everything: CPython 3.13, python-osc, the tkinter
-GUI and a **static GPL-licensed ffmpeg/ffprobe** (invoked via subprocess, so
-viOSC's own MIT license is not affected — same boundary as installing ffmpeg
-with apt). Run the AppImage like the source version: GUI by default,
-`--headless` for the console daemon. Settings live in
-`~/.config/viosc/config.json`.
+Build the self-contained AppImage (one file with everything, including the
+static ffmpeg/ffprobe used for thumbnails and preview):
+
+```bash
+bash scripts/build_appimage.sh          # dist/viosc-<APP_VERSION>-x86_64.AppImage
+bash scripts/verify_appimage.sh         # layout + headless smoke
+```
+
+Run it like the source version (GUI by default, `--headless` for the console
+daemon). Note: the AppImage bundles a **GPL-licensed static ffmpeg/ffprobe**
+as separate executables invoked via subprocess — viOSC's own MIT license is
+not affected (same boundary as installing ffmpeg with apt today).
 
 ---
 
