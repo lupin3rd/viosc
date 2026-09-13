@@ -27,12 +27,19 @@ from logbus import bus as log_bus
 from logbus import console_listener
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.3.0"
+APP_VERSION: str = "0.4.0"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666
 LOCAL_BIND_IP = "127.0.0.1"
 FROMVIMIX_PORT = 7001
+
+# e41s01: explicit receive buffer for every UDP socket the daemon binds.
+# socketserver inherits the kernel default (208 KiB on Linux), which is small for
+# the bursts this daemon receives: one state broadcast plus the monitor/watch
+# replies. 256 KiB is the named, reviewable value; the kernel caps it at
+# net.core.rmem_max and contextlib.suppress keeps a refusing platform harmless.
+RECV_BUFFER_BYTES = 262144
 
 UI_IP = os.environ.get("VIOSC_UI_IP", "127.0.0.1")
 REPLY_PORT = 6667
@@ -92,10 +99,31 @@ seen_indices: set[int] = set()
 sync_round = 0
 prune_timer: threading.Timer | None = None
 PRUNE_DELAY_SEC = 0.5
+# e41s01: STATE BROADCAST COALESCING. broadcast_vimix_state() used to run on
+# EVERY changed property (8 call sites), so one monitor round over N sources x
+# M properties could cost up to N*M whole-table JSON serializations, each one
+# taxing the consumer's UI (viseq: 0.12-2.6 ms per push, SPIKE-perf). Changes
+# inside one window now collapse into a single send: the FIRST change of a burst
+# goes out immediately (leading edge, so the common single change is never
+# delayed) and the rest wait for the trailing flush, which the sync loop runs.
+# The payload is byte-identical — only the cadence changed.
+STATE_BROADCAST_WINDOW_MS = 100
+_last_state_broadcast_at = 0.0
+_state_broadcast_pending = False
 known_indices: set[int] = set()
 monitored_sources: dict[str, list[str]] = {}
 monitor_misses: dict[str, int] = {}
 MONITOR_MAX_MISSES = 3
+# e40s05: TARGETED WATCH LANE — a client asks for a few properties of one source
+# at its own cadence and receives a targeted DELTA reply
+# (/viosc/reply/<source> <prop> <value>) at its address, instead of the
+# whole-table broadcast. Additive: the monitor registry and the broadcast above
+# stay byte-identical for older clients.
+watched_sources: dict[tuple[str, str, int], dict[str, Any]] = {}
+watch_clients: dict[tuple[str, int], Any] = {}
+WATCH_MAX_ENTRIES = 32
+WATCH_MIN_INTERVAL_MS = 50
+WATCH_MAX_INTERVAL_MS = 60000
 THUMB_MAX_CONCURRENCY = 3
 thumb_semaphore = threading.BoundedSemaphore(THUMB_MAX_CONCURRENCY)
 # e10s02: up to 3 thumbs per media at distinct jittered anchors (~15/50/85 % of duration).
@@ -116,6 +144,7 @@ def _create_clients() -> None:
     global forward_client, ui_reply_client
     forward_client = SimpleUDPClient(TOVIMIX_IP, TOVIMIX_PORT)
     ui_reply_client = SimpleUDPClient(UI_IP, REPLY_PORT)
+    watch_clients.clear()  # e40s05: the watch replies follow REPLY_PORT
 
 
 def boot(values: dict[str, Any]) -> None:
@@ -372,7 +401,7 @@ def publish_media_kind(idx, uri_value):
     kind = meta["kind"]
     if vimix_data[idx].get("media_kind") != kind:
         vimix_data[idx]["media_kind"] = kind
-        broadcast_vimix_state()
+        schedule_state_broadcast()
 
 
 def generate_thumbnails_worker(idx, uri_value):
@@ -405,20 +434,72 @@ def generate_thumbnails_worker(idx, uri_value):
             # keep the previous cache; a failed run must not wipe a good thumbnail
 
 
-def broadcast_vimix_state():
+def state_payload() -> dict[str, Any]:
+    """The state table payload — ONE serializer, TWO transports (e41s04).
+
+    The /viosc/replydata broadcast and the HTTP ``/state`` resource both build
+    their body here, so a field can never reach one transport and not the other.
+    Thumbnails are excluded: they are resources of their own (e41s03), and
+    inlining the JPEG bytes would put megabytes in every state message.
+    """
     safe_data = {
         idx: {k: v for k, v in data.items() if k != "thumbnails"}
         for idx, data in vimix_data.items()
     }
-    payload = {
+    return {
         "current_source": source_current,
         "sources": safe_data,
         "monitored": dict(monitored_sources),
     }
+
+
+def state_json() -> str:
+    """The state table as the exact JSON text both transports send (e41s04)."""
+    return json.dumps(state_payload())
+
+
+def broadcast_vimix_state():
     try:
-        ui_reply_client.send_message("/viosc/replydata", [json.dumps(payload)])
+        ui_reply_client.send_message("/viosc/replydata", [state_json()])
     except Exception as e:
         log_bus.emit(f"Broadcast error: {e}", "error")
+
+
+def schedule_state_broadcast(now: float | None = None) -> bool:
+    """Send the state broadcast now, or mark it pending inside the window (e41s01).
+
+    Leading edge: the first change after a quiet window goes out immediately, so
+    an isolated change (the common case) is never delayed. A change arriving
+    inside the window only sets the pending flag; ``flush_state_broadcast()``
+    delivers it. Returns True when a message went out now.
+    """
+    global _last_state_broadcast_at, _state_broadcast_pending
+    clock = time.time() if now is None else now
+    if clock - _last_state_broadcast_at >= STATE_BROADCAST_WINDOW_MS / 1000.0:
+        _last_state_broadcast_at = clock
+        _state_broadcast_pending = False
+        broadcast_vimix_state()
+        return True
+    _state_broadcast_pending = True
+    return False
+
+
+def flush_state_broadcast(now: float | None = None) -> bool:
+    """Deliver the coalesced broadcast once the window has elapsed (e41s01).
+
+    Returns True when a message went out, so the caller (the sync loop) can log
+    or assert it; a second call with nothing pending is a no-op.
+    """
+    global _last_state_broadcast_at, _state_broadcast_pending
+    if not _state_broadcast_pending:
+        return False
+    clock = time.time() if now is None else now
+    if clock - _last_state_broadcast_at < STATE_BROADCAST_WINDOW_MS / 1000.0:
+        return False
+    _last_state_broadcast_at = clock
+    _state_broadcast_pending = False
+    broadcast_vimix_state()
+    return True
 
 
 def start_new_sync_round():
@@ -446,7 +527,46 @@ def prune_stale_sources(round_id):
             log_bus.emit(f"{COLOR_TIMESTAMP}[PRUNE]{COLOR_RESET} Source removed: index {idx}")
     if not vimix_data:
         source_current = None
-    broadcast_vimix_state()
+    schedule_state_broadcast()
+
+
+def resolve_thumbnail_blob(name, index):
+    """JPEG bytes of one cached thumbnail frame, or None (e41s03).
+
+    The HTTP data plane's resolver: `thumbnails_for` does the by-name lookup and
+    the on-demand self-heal, so the HTTP and OSC transports can never disagree
+    about which frames exist. None becomes a 404 (unknown name, non-media
+    source, empty cache, out-of-range index).
+    """
+    thumbs = thumbnails_for(name)
+    if thumbs is None or index < 0 or index >= len(thumbs):
+        return None
+    return thumbs[index]
+
+
+def thumbnails_for(target_identifier):
+    """The cached thumbnail frames of a source, generating on demand (e41s03).
+
+    None for an unknown name, a source that is not in the table, or a non-media
+    source (no uri). An EMPTY cache with a valid uri self-heals once (e10s01) —
+    the behaviour the OSC lane always had, now shared by both transports so they
+    cannot drift.
+    """
+    idx = (
+        int(target_identifier)
+        if str(target_identifier).isdigit()
+        else find_index_by_name(str(target_identifier))
+    )
+    if idx is None or idx not in vimix_data:
+        return None
+    thumbnails = vimix_data[idx].get("thumbnails") or []
+    if thumbnails:
+        return thumbnails
+    uri_value = vimix_data[idx].get("uri")
+    if not uri_value:
+        return None
+    generate_thumbnails_worker(idx, uri_value)
+    return vimix_data[idx].get("thumbnails") or None
 
 
 def send_thumbnail_blob(target_identifier, thumb_arg):
@@ -458,18 +578,9 @@ def send_thumbnail_blob(target_identifier, thumb_arg):
     if idx is None or idx not in vimix_data:
         return
 
-    thumbnails = vimix_data[idx].get("thumbnails", [])
+    thumbnails = thumbnails_for(target_identifier)
     if not thumbnails:
-        # e10s01: an empty cache with a valid URI self-heals on demand instead of
-        # silently dropping the request. Unloadable sources (no URI / file still
-        # missing) keep the silent no-op.
-        uri_value = vimix_data[idx].get("uri")
-        if not uri_value:
-            return
-        generate_thumbnails_worker(idx, uri_value)
-        thumbnails = vimix_data[idx].get("thumbnails", [])
-        if not thumbnails:
-            return
+        return
 
     arg_str = str(thumb_arg).lower().strip()
     if arg_str == "all":
@@ -537,14 +648,14 @@ def process_monitor_command(target_identifier, args):
                 log_bus.emit(
                     f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} stopped monitoring: '{name}'"
                 )
-            broadcast_vimix_state()
+            schedule_state_broadcast()
         return
     monitored_sources[name] = props
     monitor_misses.pop(name, None)
     if LOG_LEVEL >= 1:
         log_bus.emit(f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} monitoring '{name}' -> {props}")
     request_source_props(name, props)
-    broadcast_vimix_state()
+    schedule_state_broadcast()
 
 
 def monitor_poll():
@@ -562,10 +673,129 @@ def monitor_poll():
                         f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} removed: '{name}' "
                         f"(source no longer present)"
                     )
-                broadcast_vimix_state()
+                schedule_state_broadcast()
             continue
         monitor_misses[name] = 0
         request_source_props(name, props)
+
+
+def _watch_interval(token: Any) -> int | None:
+    """A legal watch cadence in ms, or None (e40s05: clamped 50..60000)."""
+    try:
+        ms = int(float(token))
+    except (TypeError, ValueError):
+        return None
+    if ms < WATCH_MIN_INTERVAL_MS:
+        return None
+    return min(ms, WATCH_MAX_INTERVAL_MS)
+
+
+def process_watch_command(client_address, target_identifier, args) -> bool:
+    """Register/replace (or drop) a targeted watch for one requester (e40s05).
+
+    `/viosc/watch/<name> <cadence_ms> <prop...>` → subscribe; without
+    arguments → unsubscribe. The requester identity is the sender IP (its listen
+    port is REPLY_PORT, the same the UI uses); the reply goes to
+    `<sender_ip>:REPLY_PORT`. Returns True when the registry changed.
+    """
+    name = str(target_identifier)
+    if name.isdigit():
+        cached_name = vimix_data.get(int(name), {}).get("name")
+        if cached_name is not None:
+            name = str(cached_name)
+    ip = str(client_address[0]) if client_address else UI_IP
+    key = (name, ip, int(REPLY_PORT))
+    tokens = [str(a) for a in args if str(a).strip()]
+    if not tokens:
+        if key in watched_sources:
+            del watched_sources[key]
+            if LOG_LEVEL >= 1:
+                log_bus.emit(f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} stopped: '{name}' from {ip}")
+            return True
+        return False
+    interval = _watch_interval(tokens[0])
+    props = tokens[1:]
+    if interval is None or not props:
+        log_bus.emit(
+            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} ignored '{name}' from {ip}: "
+            f"need <cadence_ms {WATCH_MIN_INTERVAL_MS}..{WATCH_MAX_INTERVAL_MS}> <prop...>"
+        )
+        return False
+    if key not in watched_sources and len(watched_sources) >= WATCH_MAX_ENTRIES:
+        log_bus.emit(
+            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} ignored '{name}' from {ip}: "
+            f"at capacity ({WATCH_MAX_ENTRIES})"
+        )
+        return False
+    watched_sources[key] = {
+        "props": props,
+        "interval_ms": interval,
+        "last_poll": time.time(),
+    }
+    if LOG_LEVEL >= 1:
+        log_bus.emit(
+            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} watching '{name}' from {ip} "
+            f"every {interval} ms -> {props}"
+        )
+    request_source_props(name, props)  # immediate fast feedback, like the monitor
+    return True
+
+
+def watch_poll(now: float | None = None) -> int:
+    """Poll the due watch entries, coalescing one get per source (e40s05).
+
+    Returns how many sources were polled this round. An entry whose source no
+    longer resolves is skipped (the reply simply never comes); the registry is
+    cleaned by the unsubscribe command or the entry cap.
+    """
+    now = time.time() if now is None else now
+    due: dict[str, set[str]] = {}
+    for (name, _ip, _port), entry in watched_sources.items():
+        interval_s = max(1, int(entry["interval_ms"])) / 1000.0
+        if now - float(entry.get("last_poll", 0.0)) < interval_s:
+            continue
+        entry["last_poll"] = now
+        due.setdefault(name, set()).update(str(p) for p in entry["props"])
+    for name, props in due.items():
+        if find_index_by_name(name) is not None:
+            request_source_props(name, sorted(props))
+    return len(due)
+
+
+def _watch_client(ip: str) -> Any:
+    """The cached reply client of one requester IP (e40s05)."""
+    key = (str(ip), int(REPLY_PORT))
+    client = watch_clients.get(key)
+    if client is None:
+        client = SimpleUDPClient(key[0], key[1])
+        watch_clients[key] = client
+    return client
+
+
+def notify_watchers(idx: int, prop: str, value: Any) -> int:
+    """Send the targeted delta to every watcher of a source (e40s05).
+
+    Returns how many replies were sent. Only the CHANGED property is sent, only
+    to the requesters that asked for it: the fast lane stays O(watchers of that
+    prop), never a whole-table broadcast.
+    """
+    if not watched_sources:
+        return 0
+    name = vimix_data.get(idx, {}).get("name")
+    if not name:
+        return 0
+    sent = 0
+    for (watched_name, ip, _port), entry in list(watched_sources.items()):
+        if watched_name != name or prop not in entry["props"]:
+            continue
+        try:
+            _watch_client(ip).send_message(f"/viosc/reply/{name}", [prop, value])
+            sent += 1
+        except Exception as e:
+            log_bus.emit(
+                f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} reply to {ip} failed: {e}", "error"
+            )
+    return sent
 
 
 def process_vimix_current_message(address, args):
@@ -618,6 +848,8 @@ def process_vimix_message(address, args):
         current_val = vimix_data[idx].get(prop_name)
         is_changed = current_val != val
         vimix_data[idx][prop_name] = val
+        if is_changed:
+            notify_watchers(idx, prop_name, val)  # e40s05: the targeted fast lane
 
         if is_changed and LOG_LEVEL >= 1:
             log_bus.emit(
@@ -662,6 +894,9 @@ def create_osc_handler(server_port):
         elif clean_address.startswith("viosc/monitor/"):
             target_name = clean_address.replace("viosc/monitor/", "", 1)
             process_monitor_command(target_name, args)
+        elif clean_address.startswith("viosc/watch/"):
+            target_name = clean_address.replace("viosc/watch/", "", 1)
+            process_watch_command(client_address, target_name, args)
         elif clean_address.startswith("viosc"):
             pass
         elif server_port == FROMVIMIX_PORT and clean_address.startswith("vimix/"):
@@ -669,13 +904,13 @@ def create_osc_handler(server_port):
             if clean_address.startswith("vimix/current/"):
                 is_valid, idx, is_changed = process_vimix_current_message(address, args)
                 if is_valid and is_changed:
-                    broadcast_vimix_state()
+                    schedule_state_broadcast()
             else:
                 parsed = process_vimix_message(address, args)
                 if parsed:
                     _, _, _, is_changed = parsed
                     if is_changed:
-                        broadcast_vimix_state()
+                        schedule_state_broadcast()
         elif server_port == LISTEN_PORT:
             forward_client.send_message(address, list(args))
 
@@ -687,6 +922,8 @@ def sync_loop():
         with contextlib.suppress(Exception):
             forward_client.send_message("/vimix/current/sync", [])
         monitor_poll()
+        watch_poll()
+        flush_state_broadcast()
         time.sleep(sync_interval_time / 1000.0)
 
 
@@ -724,6 +961,16 @@ def warn_busy_ports() -> None:
         )
 
 
+def size_receive_buffer(sock) -> None:
+    """Give a UDP receive socket an explicit buffer (e41s01).
+
+    Best-effort on purpose: a kernel cap or a platform refusing the option must
+    never stop the daemon from serving (Defensive Code, AGENTS.md).
+    """
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+
+
 def start_server_instance(ip, port):
     dispatcher = Dispatcher()
     handler = create_osc_handler(port)
@@ -739,6 +986,7 @@ def start_server_instance(ip, port):
             "error",
         )
         return
+    size_receive_buffer(server.socket)
     server.serve_forever()
 
 
@@ -852,7 +1100,12 @@ def main():
         from preview_http import start_preview_server
 
         preview_server = start_preview_server(
-            PREVIEW_IP, PREVIEW_PORT, vimix_data, probe_media_meta
+            PREVIEW_IP,
+            PREVIEW_PORT,
+            vimix_data,
+            probe_media_meta,
+            resolve_thumbnail_blob,
+            state_json,
         )
         threading.Thread(target=preview_server.serve_forever, daemon=True).start()
         if LOG_LEVEL >= 1:
