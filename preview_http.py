@@ -20,9 +20,11 @@ import http.server
 import json
 import os
 import socketserver
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 CHUNK = 65536  # bytes per write while streaming a file body
+MAX_AUTH_BODY_BYTES = 4096  # POST /auth body cap (a 4-digit code is tiny)
+MAX_SESSION_BODY_BYTES = 262144  # POST /fs/session: a request carries up to 256 paths
 
 
 def clean_media_path(uri_value):
@@ -47,7 +49,9 @@ def resolve_media_path(name, vimix_data):
     return None
 
 
-def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_state=None):
+def make_preview_handler(
+    vimix_data, probe_meta, resolve_thumb=None, provide_state=None, gate=None, fs=None
+):
     """Build a handler class bound to the daemon's live state table and probe.
 
     ``probe_meta(path)`` must return the meta dict (or None); ``vimix_data``
@@ -57,6 +61,16 @@ def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_sta
     JSON text the OSC broadcast sends (e41s04): the daemon injects both for the
     same reason it injects the probe — this module never imports viosc, so the
     __main__ double-import trap cannot create a second, empty state table.
+
+    ``gate`` (e42s01) is an optional pairing authenticator: when present and
+    enabled, every request except ``POST /auth`` needs an
+    ``Authorization: Bearer <token>`` header. It is injected exactly like the
+    other collaborators so this module stays free of the daemon.
+
+    ``fs`` (e43s01) is the optional read-only filesystem surface: an object with
+    ``roots() -> list``, ``listing(path, offset) -> (payload, error)`` and
+    ``resolve_file(path) -> str | None``. When it is absent (an older daemon) the
+    ``/fs`` routes answer 404.
     """
 
     class BoundPreviewHandler(http.server.BaseHTTPRequestHandler):
@@ -69,12 +83,42 @@ def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_sta
 
         # -- routing -------------------------------------------------------
 
+        def do_POST(self):
+            """POST /auth (pairing) and POST /fs/session (write a .mix)."""
+            route = urlparse(self.path).path
+            if route == "/fs/session":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_fs_session_write()
+                return
+            if route != "/auth" or gate is None or not gate.enabled:
+                self.send_error(404)
+                return
+            body = self._read_body()
+            try:
+                code = json.loads(body).get("code")
+            except (ValueError, AttributeError):
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            token = gate.authenticate(code, self.client_address[0])
+            if token is None:
+                self._send_unauthorized()
+                return
+            self._send_json(200, {"token": token})
+
         def do_GET(self):
+            if not self._authorized():
+                self._send_unauthorized()
+                return
             if self.path.startswith("/thumb/"):
                 self._serve_thumb()
                 return
             if self.path.startswith("/state"):
                 self._serve_state()
+                return
+            if self.path.startswith("/fs/"):
+                self._serve_fs()
                 return
             if not self.path.startswith("/preview/"):
                 self.send_error(404)
@@ -98,6 +142,52 @@ def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_sta
                 self._serve_file(path)
 
         # -- endpoints -----------------------------------------------------
+
+        def _read_body(self, max_bytes: int = MAX_AUTH_BODY_BYTES) -> bytes:
+            """The request body, capped (a code is tiny, a file list is not)."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return b""
+            if length <= 0 or length > max_bytes:
+                return b""
+            return self.rfile.read(length)
+
+        def _authorized(self) -> bool:
+            """True when pairing is off or the request carries a live token."""
+            if gate is None or not gate.enabled:
+                return True
+            header = self.headers.get("Authorization", "")
+            if not header.startswith("Bearer "):
+                return False
+            return bool(gate.verify(header[len("Bearer ") :].strip()))
+
+        def _send_unauthorized(self) -> None:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("WWW-Authenticate", "Bearer")
+            body = b'{"error": "pairing required"}'
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+        def _send_jpeg(self, blob: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            self.close_connection = True
+
+        def _send_json(self, status: int, payload: dict) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
 
         def _serve_state(self):
             """The state table as JSON, KEEPING the connection alive (e41s04).
@@ -140,6 +230,106 @@ def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_sta
             self.end_headers()
             self.wfile.write(blob)
             self.close_connection = True
+
+        def _serve_fs(self):
+            """The read-only filesystem surface (e43s01) and the sessions list.
+
+            Every path is resolved by the injected adapter (realpath containment
+            against the Media Roots), and an absent adapter means an older daemon
+            with no surface at all — 404, never a fallback to an arbitrary path.
+            """
+            if fs is None:
+                self.send_error(404)
+                return
+            parsed = urlparse(self.path)
+            route = parsed.path
+            if route == "/fs/roots":
+                self._send_json(200, fs.roots())
+                return
+            if route == "/fs/sessions":
+                self._send_json(200, fs.sessions())
+                return
+            params = parse_qs(parsed.query)
+            path = (params.get("path") or [""])[0]
+            if route == "/fs/list":
+                try:
+                    offset = int((params.get("offset") or ["0"])[0])
+                except ValueError:
+                    offset = 0
+                payload, error = fs.listing(path, offset)
+                if payload is None:
+                    self._send_fs_error(error)
+                    return
+                self._send_json(200, payload)
+                return
+            if route == "/fs/thumb":
+                blob = fs.thumb(path)
+                if blob is None:
+                    self.send_error(404)
+                    return
+                self._send_jpeg(blob)
+                return
+            if route in ("/fs/raw", "/fs/meta"):
+                target = fs.resolve_file(path)
+                if target is None:
+                    self.send_error(404)
+                    return
+                if route == "/fs/meta":
+                    self._serve_meta(target)
+                else:
+                    self._serve_file(target)
+                return
+            self.send_error(404)
+
+        def _serve_fs_session_write(self):
+            """POST /fs/session: write a `.mix` draft from {name, files} (e43s06).
+
+            Body: JSON ``{"name": "Tonight", "files": ["/abs/clip.mp4", ...]}``.
+            The adapter owns the target directory, the containment, the atomic
+            write and the existence re-check; this handler only shapes the reply.
+            """
+            if fs is None or not hasattr(fs, "write_session"):
+                self.send_error(404)
+                return
+            body = self._read_body(MAX_SESSION_BODY_BYTES)
+            try:
+                payload = json.loads(body)
+                name = str(payload.get("name") or "")
+                files = payload.get("files")
+                if not isinstance(files, list):
+                    raise ValueError("files must be a list")
+                overwrite = bool(payload.get("overwrite"))
+                alphas = payload.get("alphas")
+                if alphas is not None and not isinstance(alphas, dict):
+                    raise ValueError("alphas must be an object")
+            except (ValueError, AttributeError, TypeError):
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            result, error = fs.write_session(
+                name,
+                [str(item) for item in files],
+                overwrite=overwrite,
+                alphas=alphas,
+            )
+            if result is None:
+                status = {
+                    "bad_name": 400,
+                    "no_files": 400,
+                    "missing_file": 409,
+                    "unwritable": 500,
+                }.get(error, 400)
+                self._send_json(status, {"error": error or "error"})
+                return
+            self._send_json(200, result)
+
+        def _send_fs_error(self, error):
+            status = {
+                "forbidden": 403,
+                "not_found": 404,
+                "not_dir": 400,
+                "unreadable": 403,
+            }.get(error, 400)
+            self._send_json(status, {"error": error or "error"})
 
         def _serve_meta(self, path):
             meta = probe_meta(path)
@@ -221,9 +411,13 @@ def make_preview_handler(vimix_data, probe_meta, resolve_thumb=None, provide_sta
     return BoundPreviewHandler
 
 
-def start_preview_server(ip, port, vimix_data, probe_meta, resolve_thumb=None, provide_state=None):
+def start_preview_server(
+    ip, port, vimix_data, probe_meta, resolve_thumb=None, provide_state=None, gate=None, fs=None
+):
     """Bind (and return) the preview HTTP server against the daemon's state."""
-    handler = make_preview_handler(vimix_data, probe_meta, resolve_thumb, provide_state)
+    handler = make_preview_handler(
+        vimix_data, probe_meta, resolve_thumb, provide_state, gate, fs
+    )
 
     class PreviewServer(socketserver.ThreadingTCPServer):
         allow_reuse_address = True

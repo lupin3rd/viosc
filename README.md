@@ -145,6 +145,34 @@ VIOSC_UI_IP=192.168.1.50 python viosc.py
 | `MONITOR_MAX_MISSES` | `3` | Consecutive failed polls before a monitor entry is dropped. |
 | `THUMB_MAX_CONCURRENCY` | `3` | Maximum simultaneous FFmpeg thumbnail extractions. |
 
+### Pairing (default ON)
+
+viOSC shows a random **4-digit code** at every start (prominent in the GUI; in
+the log/console under `--headless`) and, with `pairing.enabled` (the default),
+accepts a peer only after that peer has presented the code:
+
+- **HTTP data plane (`:8686`)** — `POST /auth` with `{"code": "1234"}` returns a
+  bearer token; every other request needs `Authorization: Bearer <token>` and
+  otherwise answers **401**.
+- **OSC planes** — a successful HTTP auth binds the peer's source IP for the OSC
+  input (including the `/vimix/*` forward) and the state/thumbnail output; an
+  OSC-only client can bind with the additive `/viosc/auth <code>` message.
+
+| Setting (config JSON) | Default | Description |
+| :--- | :--- | :--- |
+| `pairing_enabled` | `true` | Require the code on every surface. Set `false` to restore the previous open behaviour. |
+| `pairing_code_length` | `4` | Digits in the code (rotates at every start, never persisted). |
+| `pairing_lease_seconds` | `3600` | How long a bound peer stays bound (it re-authenticates after). |
+| `pairing_trusted_peers` | `[]` | IPs that bypass pairing (the escape for third-party OSC controllers). |
+| `pairing_lock_after` | `5` | Consecutive failed attempts before that peer is locked. |
+| `pairing_lock_seconds` | `60` | Lock duration, and the window for the global failure counter. |
+| `pairing_global_lock_after` | `20` | Failures across all peers before the code **regenerates** and auth freezes briefly. |
+
+Honest limitation: this is a *pairing* measure, **not encryption**. The code and
+the traffic are plaintext UDP/HTTP, and a spoofed source IP can impersonate a
+bound peer. It keeps casual and misconfigured hosts out on a LAN; combine it with
+a firewall for anything stronger.
+
 ---
 
 ## OSC Protocol Reference
@@ -164,6 +192,16 @@ Two things to know about how Vimix replies:
 The monitor registry is **keyed by name** on purpose: Vimix re-indexes sources on reorder/removal, while a name only changes when a user renames the source manually.
 
 ### Commands — port 6666 (input)
+
+#### `/viosc/auth <code>`
+
+Present the pairing code to bind this peer's source IP for the OSC planes (the
+additive counterpart of `POST /auth`, for OSC-only controllers). Ignored when
+`pairing_enabled` is `false`.
+
+```osc
+/viosc/auth 1234
+```
 
 #### `/viosc/monitor/<name> [prop1 prop2 ...]`
 
@@ -269,7 +307,7 @@ Full state broadcast, sent whenever a value changes (and at start-up/prune). Sin
 - A monitor entry is keyed by name: it survives Vimix reordering, but **stops following a renamed source** (removed after `MONITOR_MAX_MISSES` missed polls).
 - `get` replies addressed by name are ingested only for sources already present in the cache — a source enters the cache at the next sync round (≤ 2 s).
 - If Vimix holds **zero sources**, no sync markers arrive and the cache keeps its last state until a non-empty session is synced.
-- The input port binds `0.0.0.0` with no authentication: any host that can reach port 6666 can send commands to Vimix through viOSC. Restrict it at the network level if this matters to you.
+- The input port binds `0.0.0.0`. Since pairing is **on by default** (see [Pairing](#pairing-default-on)) an unbound host cannot drive Vimix through viOSC, nor read the `:8686` data plane — but pairing is a shared-code gate over plaintext traffic, not encryption, so restrict the ports at the network level for anything stronger.
 
 ---
 

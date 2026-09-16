@@ -104,6 +104,15 @@ class VioscWindow:
         )
         note.pack(anchor="w", pady=(0, 4))
 
+        if getattr(self.daemon, "PAIRING_ENABLED", False):
+            code = getattr(self.daemon, "PAIRING_CODE", "")
+            ttk.Label(
+                outer,
+                text=f"Pairing code: {code}",
+                font=("TkDefaultFont", 16, "bold"),
+                foreground="#0050a0",
+            ).pack(anchor="w", pady=(0, 4))
+
         self._build_form(outer)
         self._build_log(outer)
         self._build_footer(outer)
@@ -125,7 +134,7 @@ class VioscWindow:
             row, col = divmod(index, FORM_COLUMNS)
             grid_col = col * 2
             active = getattr(self.daemon, config.daemon_attr(key))
-            var = tk.StringVar(value=str(active))
+            var = tk.StringVar(value=config.format_field(key, active))
             self.entry_vars[key] = var
             ttk.Label(parent, text=_pretty_name(key), anchor="e").grid(
                 row=row, column=grid_col, sticky="e", padx=(2, 4), pady=1
@@ -154,6 +163,12 @@ class VioscWindow:
         ).pack(anchor="w", pady=(0, 2))
         self.advanced_frame = ttk.LabelFrame(outer, text="Advanced", padding=4)
         self._field_grid(self.advanced_frame, config.advanced_fields())
+        hint_row = (len(config.advanced_fields()) + FORM_COLUMNS - 1) // FORM_COLUMNS
+        ttk.Label(
+            self.advanced_frame,
+            text="fs_roots: comma-separated absolute folders (e.g. /mnt/media, ~/videos)",
+            foreground="#666666",
+        ).grid(row=hint_row, column=0, columnspan=FORM_COLUMNS * 2, sticky="w", pady=(2, 0))
 
     def _toggle_advanced(self) -> None:
         if self.show_advanced.get():

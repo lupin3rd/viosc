@@ -23,11 +23,14 @@ except ImportError:
     sys.exit(1)
 
 import config
+import fs_api
+import mix_schema
+import pairing
 from logbus import bus as log_bus
 from logbus import console_listener
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.4.0"
+APP_VERSION: str = "0.5.0"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666
@@ -53,6 +56,28 @@ FFPROBE_PATH = os.environ.get("VIOSC_FFPROBE", "ffprobe")
 LOG_LEVEL = 1
 
 sync_interval_time = 2000
+
+# e42s01: LINK PAIRING. With pairing enabled (the default) a peer must present
+# the code shown at start before its OSC input (including the /vimix forward) or
+# its :8686 HTTP requests are accepted. The code lives in memory only and
+# rotates on every boot; PAIRING_TRUSTED_PEERS bypasses pairing for known hosts.
+PAIRING_ENABLED = True
+PAIRING_CODE_LENGTH = 4
+PAIRING_LEASE_SECONDS = 3600
+PAIRING_TRUSTED_PEERS: list[str] = []
+PAIRING_CODE = ""
+PAIRING_LOCK_AFTER = 5
+PAIRING_LOCK_SECONDS = 60
+PAIRING_GLOBAL_LOCK_AFTER = 20
+# e43s01: the read-only /fs media browser on machine A (see fs_api.py).
+FS_ROOTS: list[str] = ["~"]
+FS_SHOW_HIDDEN = False
+FS_PAGE_SIZE = 500
+FS_SESSIONS_DIR = "~/vimix-sessions"
+PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS, PAIRING_TRUSTED_PEERS)
+PAIRING_GATE = pairing.PairingGate(
+    False, "", PEER_REGISTRY, PAIRING_LEASE_SECONDS
+)  # import default keeps the pre-e42 behaviour; boot() arms the real gate
 
 ALL_PROPERTIES = [
     "index",
@@ -147,6 +172,22 @@ def _create_clients() -> None:
     watch_clients.clear()  # e40s05: the watch replies follow REPLY_PORT
 
 
+def _on_pairing_code_regenerated(code: str) -> None:
+    """A regenerated code must reach the operator (e42s03).
+
+    The gate calls this after the global failure threshold: update the daemon
+    state so the GUI re-renders it and log it, so a headless daemon prints the
+    new code too.
+    """
+    global PAIRING_CODE
+    PAIRING_CODE = code
+    log_bus.emit(
+        f"{COLOR_RESET_EV}[PAIRING]{COLOR_RESET} too many failed attempts — "
+        f"new code {code}",
+        "error",
+    )
+
+
 def boot(values: dict[str, Any]) -> None:
     """Apply an effective config dict (config.effective) to the daemon state.
 
@@ -160,6 +201,11 @@ def boot(values: dict[str, Any]) -> None:
     global UI_IP, REPLY_PORT, FFMPEG_PATH, FFPROBE_PATH
     global LOG_LEVEL, sync_interval_time, PRUNE_DELAY_SEC
     global MONITOR_MAX_MISSES, THUMB_MAX_CONCURRENCY, THUMB_MAX_COUNT
+    global PAIRING_ENABLED, PAIRING_CODE_LENGTH, PAIRING_LEASE_SECONDS
+    global PAIRING_TRUSTED_PEERS, PAIRING_CODE
+    global PEER_REGISTRY, PAIRING_GATE
+    global PAIRING_LOCK_AFTER, PAIRING_LOCK_SECONDS, PAIRING_GLOBAL_LOCK_AFTER
+    global FS_ROOTS, FS_SHOW_HIDDEN, FS_PAGE_SIZE, FS_SESSIONS_DIR
     LISTEN_IP = values["listen_ip"]
     LISTEN_PORT = values["listen_port"]
     LOCAL_BIND_IP = values["local_bind_ip"]
@@ -178,6 +224,29 @@ def boot(values: dict[str, Any]) -> None:
     MONITOR_MAX_MISSES = values["monitor_max_misses"]
     THUMB_MAX_CONCURRENCY = values["thumb_max_concurrency"]
     THUMB_MAX_COUNT = values["thumb_max_count"]
+    PAIRING_ENABLED = values["pairing_enabled"]
+    PAIRING_CODE_LENGTH = values["pairing_code_length"]
+    PAIRING_LEASE_SECONDS = values["pairing_lease_seconds"]
+    PAIRING_TRUSTED_PEERS = list(values["pairing_trusted_peers"])
+    PAIRING_CODE = pairing.generate_code(PAIRING_CODE_LENGTH) if PAIRING_ENABLED else ""
+    PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS, PAIRING_TRUSTED_PEERS)
+    PAIRING_LOCK_AFTER = values["pairing_lock_after"]
+    PAIRING_LOCK_SECONDS = values["pairing_lock_seconds"]
+    PAIRING_GLOBAL_LOCK_AFTER = values["pairing_global_lock_after"]
+    FS_ROOTS = list(values["fs_roots"])
+    FS_SHOW_HIDDEN = values["fs_show_hidden"]
+    FS_PAGE_SIZE = values["fs_page_size"]
+    FS_SESSIONS_DIR = values["fs_sessions_dir"]
+    PAIRING_GATE = pairing.PairingGate(
+        PAIRING_ENABLED,
+        PAIRING_CODE,
+        PEER_REGISTRY,
+        PAIRING_LEASE_SECONDS,
+        lock_after=PAIRING_LOCK_AFTER,
+        lock_seconds=PAIRING_LOCK_SECONDS,
+        global_lock_after=PAIRING_GLOBAL_LOCK_AFTER,
+        on_regenerate=_on_pairing_code_regenerated,
+    )
     global thumb_semaphore
     thumb_semaphore = threading.BoundedSemaphore(THUMB_MAX_CONCURRENCY)
     _create_clients()
@@ -459,10 +528,17 @@ def state_json() -> str:
 
 
 def broadcast_vimix_state():
+    if not _ui_allowed():
+        return
     try:
         ui_reply_client.send_message("/viosc/replydata", [state_json()])
     except Exception as e:
         log_bus.emit(f"Broadcast error: {e}", "error")
+
+
+def _ui_allowed() -> bool:
+    """True when the configured UI peer may receive replies (e42s01)."""
+    return PAIRING_GATE.is_bound(UI_IP)
 
 
 def schedule_state_broadcast(now: float | None = None) -> bool:
@@ -570,6 +646,8 @@ def thumbnails_for(target_identifier):
 
 
 def send_thumbnail_blob(target_identifier, thumb_arg):
+    if not _ui_allowed():
+        return
     idx = (
         int(target_identifier)
         if str(target_identifier).isdigit()
@@ -868,6 +946,22 @@ def process_vimix_message(address, args):
 def create_osc_handler(server_port):
     def osc_handler(client_address, address, *args):
         clean_address = address.lstrip("/")
+        peer_ip = (
+            client_address[0]
+            if isinstance(client_address, (tuple, list)) and client_address
+            else str(client_address)
+        )
+
+        # e42s01: the authenticator is always accepted; every other message from
+        # an unbound peer is dropped BEFORE it can reach vimix (the forward and
+        # the /viosc/* commands alike).
+        if clean_address.rstrip("/") == "viosc/auth":
+            code = args[0] if args else ""
+            if not PAIRING_GATE.authenticate_peer(code, peer_ip) and LOG_LEVEL >= 1:
+                log_bus.emit(f"{COLOR_RESET_EV}[PAIRING]{COLOR_RESET} rejected {peer_ip}", "error")
+            return
+        if not PAIRING_GATE.is_bound(peer_ip):
+            return
 
         if clean_address.startswith("viosc/thumb/"):
             target_identifier = clean_address.replace("viosc/thumb/", "", 1)
@@ -1038,6 +1132,74 @@ def _report_gui_fatal() -> None:
         print(detail or "viOSC startup failed")
 
 
+def _generate_fs_thumb(path: str) -> bytes | None:
+    """One JPEG frame for the File Manager browser (e43s03).
+
+    Reuses the daemon's ffmpeg extraction under the EXISTING concurrency
+    semaphore, so a folder full of videos cannot fan out unbounded.
+    """
+    with thumb_semaphore:
+        blobs = extract_thumbnails_from_file(path, count=1)
+    return blobs[0] if blobs else None
+
+
+FS_THUMB_CACHE = fs_api.ThumbnailCache(_generate_fs_thumb)
+
+
+class _FsAccess:
+    """Bind the read-only fs surface to the booted Media Roots (e43s01).
+
+    The HTTP handler only sees these methods, so the config and the
+    containment rules stay on this side of the boundary; the globals are read at
+    call time, so a restart with new roots needs no rebuild of the server.
+    """
+
+    def roots(self) -> list[dict[str, Any]]:
+        return fs_api.roots_info(FS_ROOTS)
+
+    def listing(self, path: str, offset: int) -> tuple[dict[str, Any] | None, str | None]:
+        return fs_api.list_directory(
+            path, FS_ROOTS, show_hidden=FS_SHOW_HIDDEN, page_size=FS_PAGE_SIZE, offset=offset
+        )
+
+    def resolve_file(self, path: str) -> str | None:
+        return fs_api.resolve_file(path, FS_ROOTS)
+
+    def thumb(self, path: str) -> bytes | None:
+        """The cached JPEG of a media file inside the roots, else None (e43s03)."""
+        target = fs_api.resolve_file(path, FS_ROOTS)
+        if target is None:
+            return None
+        if fs_api.classify(target) not in (fs_api.MEDIA_VIDEO, fs_api.MEDIA_IMAGE):
+            return None
+        return FS_THUMB_CACHE.get(target)
+
+    def sessions(self) -> list[dict[str, Any]]:
+        """The written Session Drafts on disk (e43s06)."""
+        return mix_schema.list_sessions(os.path.expanduser(FS_SESSIONS_DIR))
+
+    def write_session(
+        self,
+        name: str,
+        files: list[str],
+        *,
+        overwrite: bool = False,
+        alphas: dict[str, float] | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        """Write a `.mix` draft into the configured sessions directory (e43s06).
+
+        ``overwrite`` (e44s02) replaces the exact named file instead of suffixing;
+        ``alphas`` (e45s01) encodes each source's output alpha.
+        """
+        return mix_schema.write_session(
+            os.path.expanduser(FS_SESSIONS_DIR),
+            name,
+            files,
+            overwrite=overwrite,
+            alphas=alphas,
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="viosc", description="viOSC OSC router/state mirror for Vimix"
@@ -1079,6 +1241,10 @@ def main():
     log_bus.emit(f"   from vimix: {LOCAL_BIND_IP}:{FROMVIMIX_PORT}   (vimix default OSC replies)")
     log_bus.emit(f"   output  : {UI_IP}:{REPLY_PORT}   (state / thumbnails / monitor for the UI)")
     log_bus.emit(f"   preview : {PREVIEW_IP}:{PREVIEW_PORT}   (HTTP file/meta transport, e38s01)")
+    if PAIRING_ENABLED:
+        log_bus.emit(
+            f"   pairing : code {PAIRING_CODE}   (pairing ON — enter this code in the UI)"
+        )
     log_bus.emit(
         "=========================================================================================="
     )
@@ -1106,6 +1272,8 @@ def main():
             probe_media_meta,
             resolve_thumbnail_blob,
             state_json,
+            PAIRING_GATE,
+            _FsAccess(),
         )
         threading.Thread(target=preview_server.serve_forever, daemon=True).start()
         if LOG_LEVEL >= 1:
