@@ -72,6 +72,78 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "default": 3,
         "attr": "THUMB_MAX_CONCURRENCY",
     },
+    # e42s01: link pairing (default ON). The code is generated at every start;
+    # trusted peers bypass pairing (the escape for third-party OSC clients).
+    "pairing_enabled": {
+        "group": "live",
+        "type": "bool",
+        "default": True,
+        "attr": "PAIRING_ENABLED",
+    },
+    "pairing_code_length": {
+        "group": "live",
+        "type": "count",
+        "default": 4,
+        "attr": "PAIRING_CODE_LENGTH",
+    },
+    "pairing_lease_seconds": {
+        "group": "live",
+        "type": "seconds",
+        "default": 3600,
+        "attr": "PAIRING_LEASE_SECONDS",
+    },
+    "pairing_trusted_peers": {
+        "group": "live",
+        "type": "list",
+        "default": [],
+        "attr": "PAIRING_TRUSTED_PEERS",
+    },
+    # e42s03: abuse resistance (a 4-digit code is brute-forced without limits).
+    "pairing_lock_after": {
+        "group": "live",
+        "type": "count",
+        "default": 5,
+        "attr": "PAIRING_LOCK_AFTER",
+    },
+    "pairing_lock_seconds": {
+        "group": "live",
+        "type": "seconds",
+        "default": 60,
+        "attr": "PAIRING_LOCK_SECONDS",
+    },
+    "pairing_global_lock_after": {
+        "group": "live",
+        "type": "count",
+        "default": 20,
+        "attr": "PAIRING_GLOBAL_LOCK_AFTER",
+    },
+    # e43s01: the read-only /fs media browser (machine A). fs_roots is the
+    # allow-list every requested path must resolve inside; fs_sessions_dir is the
+    # only directory the .mix writer may touch (e43s06).
+    "fs_roots": {
+        "group": "live",
+        "type": "list",
+        "default": ["~"],
+        "attr": "FS_ROOTS",
+    },
+    "fs_show_hidden": {
+        "group": "live",
+        "type": "bool",
+        "default": False,
+        "attr": "FS_SHOW_HIDDEN",
+    },
+    "fs_page_size": {
+        "group": "live",
+        "type": "count",
+        "default": 500,
+        "attr": "FS_PAGE_SIZE",
+    },
+    "fs_sessions_dir": {
+        "group": "live",
+        "type": "path",
+        "default": "~/vimix-sessions",
+        "attr": "FS_SESSIONS_DIR",
+    },
 }
 
 DEFAULTS: dict[str, Any] = {k: spec["default"] for k, spec in FIELD_SPEC.items()}
@@ -100,6 +172,17 @@ VISIBILITY: dict[str, str] = {
     "monitor_max_misses": "hidden",
     "thumb_max_count": "advanced",
     "thumb_max_concurrency": "hidden",
+    "pairing_enabled": "essential",
+    "pairing_code_length": "advanced",
+    "pairing_lease_seconds": "hidden",
+    "pairing_trusted_peers": "advanced",
+    "pairing_lock_after": "hidden",
+    "pairing_lock_seconds": "hidden",
+    "pairing_global_lock_after": "hidden",
+    "fs_roots": "advanced",
+    "fs_show_hidden": "advanced",
+    "fs_page_size": "hidden",
+    "fs_sessions_dir": "advanced",
 }
 
 
@@ -168,6 +251,12 @@ def is_valid_value(key: str, value: Any) -> bool:
         )
     if vtype == "seconds":
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+    if vtype == "bool":
+        return isinstance(value, bool)
+    if vtype == "list":
+        return isinstance(value, list) and all(
+            isinstance(item, str) and bool(item.strip()) for item in value
+        )
     if vtype in ("ip", "path"):
         return isinstance(value, str) and bool(value.strip())
     return False
@@ -198,7 +287,10 @@ def parse_form(
     """
     base = DEFAULTS if base is None else base
     problems = []
-    values: dict[str, Any] = dict(base)
+    values: dict[str, Any] = {
+        key: (list(value) if isinstance(value, list) else value)
+        for key, value in base.items()
+    }
     for key, text in raw.items():
         if key not in FIELD_SPEC:
             problems.append(f"unknown config key '{key}' (ignored)")
@@ -266,9 +358,53 @@ def _coerce(key: str, raw: Any) -> Any:
         return _to_int(raw)
     if vtype == "seconds":
         return _to_float(raw)
+    if vtype == "bool":
+        return _to_bool(raw)
+    if vtype == "list":
+        return _to_list(raw)
     if vtype in ("ip", "path"):
         return raw if isinstance(raw, str) else None
     return None
+
+
+def _to_bool(raw: Any) -> bool | None:
+    """Coerce a JSON/env/form scalar into a bool, or None when unusable."""
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        text = raw.strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True
+        if text in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
+def _to_list(raw: Any) -> list[str] | None:
+    """Coerce a JSON list or a comma-separated string into a list of strings."""
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, str):
+                return None
+        return [item.strip() for item in raw if item.strip()]
+    if isinstance(raw, str):
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return None
+
+
+def format_field(key: str, value: Any) -> str:
+    """The GUI entry text for one config value (BUG-2026-09-15T201625).
+
+    A ``list`` field joins with "`, `" so the entry shows the same syntax
+    ``_to_list`` parses back; a Python list repr (`['~']`) would be saved as a
+    single bogus item. Every other field keeps ``str(value)``.
+    """
+    spec = FIELD_SPEC.get(key) or {}
+    if spec.get("type") == "list" and isinstance(value, list):
+        return ", ".join(str(item) for item in value)
+    return str(value)
 
 
 def effective(
@@ -281,7 +417,10 @@ def effective(
     silently winning.
     """
     env = os.environ if env is None else env
-    values: dict[str, Any] = dict(DEFAULTS)
+    values: dict[str, Any] = {
+        key: (list(value) if isinstance(value, list) else value)
+        for key, value in DEFAULTS.items()
+    }
     sources: dict[str, str] = dict.fromkeys(DEFAULTS, "default")
     warnings: list[str] = []
     for key, raw in _env_values(env).items():
