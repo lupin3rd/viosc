@@ -1,25 +1,25 @@
-"""Minimal viOSC window (e01s05/s07) — tiered config form + timed log + status.
+"""Minimal viOSC dashboard (e58s02) — read-only status, local bind, log.
 
 The ONLY module that imports tkinter: the daemon core, config and logbus are
 GUI-free by construction. The window is a thin front-end over the live daemon
 module (injected as ``daemon`` — never imported by name, avoiding the
 ``__main__`` double-import trap):
 
-- a config form in two tiers (user decision 2026-09-08, option B): the
-  ESSENTIAL wiring is always visible (2 rows), a collapsible 'Advanced
-  settings' section holds the rest. JSON-only fields (ffmpeg resolution,
-  internal tuning) are never shown and are preserved on save via ``base``,
-- a live log pane with per-line wall-clock timestamps and an 'All / Errors
-  only' view filter, fed by the logbus queue and pumped on the main thread,
-- a status row fed by the e01s04 Vimix-activity markers,
-- ONE "Apply & restart" button: validate -> save the JSON -> re-exec the
-  process (os.execv, same pid).
+- the pairing code large (the operator reads it to pair viSeq),
+- connection statistics (source count, Vimix last-seen, message counts),
+- the LOCAL bind fields (preview_ip/preview_port) — the only editable inputs,
+  applied locally via a same-pid restart (the management plane must never be
+  reconfigured through itself from the remote UI),
+- a READ-ONLY snapshot of the effective config with per-field source markers,
+  and a live log pane with timestamps and an All/Errors filter.
 
-GUI mode is the whole app: nothing is printed to the terminal. Labels are
-English. Closing the window ends the process.
+Everything else is configured from viSeq over HTTP /config (e58s01). GUI mode is
+the whole app: nothing is printed to the terminal. Closing the window ends the
+process.
 """
 
 import contextlib
+import json
 import os
 import queue
 import sys
@@ -33,8 +33,9 @@ from logbus import bus as log_bus
 
 LOG_PUMP_MS = 50
 STATUS_POLL_MS = 1000
+CONFIG_POLL_MS = 2000
 LOG_QUEUE_MAX = 500
-FORM_COLUMNS = 3
+FORM_COLUMNS = 2
 TIMESTAMP_FMT = "%H:%M:%S"
 FILTER_ALL = "All"
 FILTER_ERRORS = "Errors only"
@@ -56,8 +57,22 @@ def _format_idle(seconds: float | None) -> str:
     return f"{secs}s ago"
 
 
+def render_snapshot(values: dict[str, Any], sources: dict[str, str]) -> str:
+    """A read-only, sorted rendering of the effective config (e58s02).
+
+    Every key is shown (including the hidden Vimix/ffmpeg fields) so the operator
+    can see the full picture on machine A; the per-field source marker
+    (json/env/default) explains where each value came from.
+    """
+    return "\n".join(
+        f"{key} = {config.format_field(key, values[key])} "
+        f"({sources.get(key, 'default')})"
+        for key in sorted(values)
+    )
+
+
 class VioscWindow:
-    """Builds and runs the single window (widgets owned by this class)."""
+    """Builds and runs the single dashboard window (widgets owned by this class)."""
 
     def __init__(
         self,
@@ -70,7 +85,7 @@ class VioscWindow:
         self.cfg_path = cfg_path
         self.sources = sources
         self.base_values = base_values
-        self.entry_vars: dict[str, tk.StringVar] = {}
+        self.bind_vars: dict[str, tk.StringVar] = {}
         self.log_queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=LOG_QUEUE_MAX)
         self.log_lines: list[tuple[str, str]] = []  # (level, rendered line)
         self.log_filter = FILTER_ALL
@@ -78,8 +93,8 @@ class VioscWindow:
         self.root = tk.Tk()
         version = getattr(self.daemon, "APP_VERSION", "")
         self.root.title(f"viOSC {version}" if version else "viOSC")
-        self.root.geometry("680x540")
-        self.root.minsize(560, 420)
+        self.root.geometry("680x560")
+        self.root.minsize(560, 440)
         self._build()
 
     # -- layout -------------------------------------------------------------
@@ -90,91 +105,82 @@ class VioscWindow:
 
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 2))
-        ttk.Label(header, text="viOSC", font=("TkDefaultFont", 12, "bold")).pack(side="left")
+        ttk.Label(header, text="viOSC", font=("TkDefaultFont", 12, "bold")).pack(
+            side="left"
+        )
         version = getattr(self.daemon, "APP_VERSION", "")
         if version:
             ttk.Label(header, text=f"v{version}", foreground="#666666").pack(
                 side="left", padx=(6, 0), pady=(2, 0)
             )
-        note = ttk.Label(
-            outer,
-            text="Settings are saved to the config file and applied on restart: "
-            "'Apply & restart' relaunches the daemon with the new values.",
-            wraplength=660,
-        )
-        note.pack(anchor="w", pady=(0, 4))
 
         if getattr(self.daemon, "PAIRING_ENABLED", False):
             code = getattr(self.daemon, "PAIRING_CODE", "")
             ttk.Label(
                 outer,
                 text=f"Pairing code: {code}",
-                font=("TkDefaultFont", 16, "bold"),
+                font=("TkDefaultFont", 18, "bold"),
                 foreground="#0050a0",
             ).pack(anchor="w", pady=(0, 4))
 
-        self._build_form(outer)
+        self._build_bind(outer)
+        self._build_snapshot(outer)
         self._build_log(outer)
-        self._build_footer(outer)
+
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x", pady=(4, 0))
+        self.status_var = tk.StringVar(value="Vimix: no data from Vimix yet")
+        ttk.Label(footer, textvariable=self.status_var).pack(side="left")
 
         self.error_var = tk.StringVar()
-        ttk.Label(outer, textvariable=self.error_var, foreground="#c00000").pack(anchor="w")
-        for key, env_var in config.ENV_VAR_MAP.items():
-            if self.sources.get(key) == "env":
-                self.error_var.set(
-                    f"note: {_pretty_name(key)} is currently set by the {env_var} "
-                    "environment variable"
-                )
+        ttk.Label(outer, textvariable=self.error_var, foreground="#c00000").pack(
+            anchor="w"
+        )
 
-    def _field_grid(self, parent, keys: list[str]) -> None:
-        """Grid of (label, entry) pairs, FORM_COLUMNS field columns wide."""
+    def _build_bind(self, outer) -> None:
+        frame = ttk.LabelFrame(outer, text="Local bind (machine A only)", padding=4)
+        frame.pack(fill="x", pady=(0, 4))
         for column in range(FORM_COLUMNS * 2):
-            parent.columnconfigure(column, weight=1, uniform="field")
-        for index, key in enumerate(keys):
+            frame.columnconfigure(column, weight=1)
+        for index, key in enumerate(config.local_only_fields()):
             row, col = divmod(index, FORM_COLUMNS)
             grid_col = col * 2
             active = getattr(self.daemon, config.daemon_attr(key))
             var = tk.StringVar(value=config.format_field(key, active))
-            self.entry_vars[key] = var
-            ttk.Label(parent, text=_pretty_name(key), anchor="e").grid(
+            self.bind_vars[key] = var
+            ttk.Label(frame, text=_pretty_name(key), anchor="e").grid(
                 row=row, column=grid_col, sticky="e", padx=(2, 4), pady=1
             )
-            ttk.Entry(parent, textvariable=var).grid(
+            ttk.Entry(frame, textvariable=var).grid(
                 row=row, column=grid_col + 1, sticky="ew", padx=(0, 6), pady=1
             )
-
-    def _build_form(self, outer) -> None:
-        essential = ttk.LabelFrame(outer, text="Configuration", padding=4)
-        essential.pack(fill="x", pady=(0, 2))
-        self._field_grid(essential, config.essential_fields())
-        hint = ttk.Label(
-            outer,
-            text="Ports match viseq/Vimix defaults — change them only in a non-standard setup.",
-            foreground="#666666",
+        ttk.Button(frame, text="Apply & restart", command=self._on_apply_bind).grid(
+            row=1, column=FORM_COLUMNS * 2 - 1, sticky="e", pady=(2, 0)
         )
-        hint.pack(anchor="w", pady=(0, 2))
-
-        self.show_advanced = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            outer,
-            text="Advanced settings",
-            variable=self.show_advanced,
-            command=self._toggle_advanced,
-        ).pack(anchor="w", pady=(0, 2))
-        self.advanced_frame = ttk.LabelFrame(outer, text="Advanced", padding=4)
-        self._field_grid(self.advanced_frame, config.advanced_fields())
-        hint_row = (len(config.advanced_fields()) + FORM_COLUMNS - 1) // FORM_COLUMNS
         ttk.Label(
-            self.advanced_frame,
-            text="fs_roots: comma-separated absolute folders (e.g. /mnt/media, ~/videos)",
+            outer,
+            text="Everything else is configured from viSeq (Settings > viOSC).",
             foreground="#666666",
-        ).grid(row=hint_row, column=0, columnspan=FORM_COLUMNS * 2, sticky="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(0, 2))
 
-    def _toggle_advanced(self) -> None:
-        if self.show_advanced.get():
-            self.advanced_frame.pack(fill="x", pady=(0, 4))
-        else:
-            self.advanced_frame.pack_forget()
+    def _build_snapshot(self, outer) -> None:
+        frame = ttk.LabelFrame(outer, text="Configuration (read-only)", padding=4)
+        frame.pack(fill="x", pady=(0, 4))
+        text = tk.Text(frame, height=10, wrap="none", state="disabled")
+        scroll = ttk.Scrollbar(frame, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.snapshot_text = text
+        self._config_sig = json.dumps(self.base_values, sort_keys=True, default=str)
+        self._set_snapshot(self.base_values, self.sources)
+
+    def _set_snapshot(self, values: dict[str, Any], sources: dict[str, str]) -> None:
+        """Replace the read-only snapshot body (main thread only)."""
+        self.snapshot_text.configure(state="normal")
+        self.snapshot_text.delete("1.0", "end")
+        self.snapshot_text.insert("1.0", render_snapshot(values, sources))
+        self.snapshot_text.configure(state="disabled")
 
     def _build_log(self, outer) -> None:
         frame = ttk.LabelFrame(outer, text="Log", padding=4)
@@ -199,13 +205,6 @@ class VioscWindow:
         self.log_text.tag_configure("err", foreground="#c00000")
         self.log_text.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
-
-    def _build_footer(self, outer) -> None:
-        footer = ttk.Frame(outer)
-        footer.pack(fill="x")
-        self.status_var = tk.StringVar(value="Vimix: no data from Vimix yet")
-        ttk.Label(footer, textvariable=self.status_var).pack(side="left")
-        ttk.Button(footer, text="Apply & restart", command=self._on_apply).pack(side="right")
 
     # -- log rendering ------------------------------------------------------
 
@@ -239,15 +238,15 @@ class VioscWindow:
 
     # -- tk callbacks -------------------------------------------------------
 
-    def _on_apply(self) -> None:
-        raw = {key: var.get() for key, var in self.entry_vars.items()}
+    def _on_apply_bind(self) -> None:
+        raw = {key: var.get() for key, var in self.bind_vars.items()}
         values, problems = config.parse_form(raw, base=self.base_values)
         if problems:
             self.error_var.set(" ".join(problems))
             return
         self.error_var.set("")
-        config.save(self.cfg_path, values)
-        # Same-pid re-exec: fresh boot reads the just-saved JSON.
+        config.merge_save(self.cfg_path, {k: values[k] for k in config.local_only_fields()})
+        # Same-pid re-exec: fresh boot reads the just-saved bind.
         os.execv(sys.executable, self.daemon.restart_command())
 
     # -- pumps --------------------------------------------------------------
@@ -271,6 +270,20 @@ class VioscWindow:
         )
         self.root.after(STATUS_POLL_MS, self.poll_status)
 
+    def poll_config(self) -> None:
+        """Re-render the snapshot when the on-disk config changed (e58s02).
+
+        The config file is the single source of truth (a save from viSeq already
+        persists every applied field), so a periodic re-read keeps the dashboard
+        honest without a cross-thread GUI call from the HTTP handler.
+        """
+        values, sources, _ = config.load_effective(self.cfg_path)
+        sig = json.dumps(values, sort_keys=True, default=str)
+        if sig != self._config_sig:
+            self._config_sig = sig
+            self._set_snapshot(values, sources)
+        self.root.after(CONFIG_POLL_MS, self.poll_config)
+
     def on_close(self) -> None:
         log_bus.unsubscribe(self._bus_listener)
         self.root.destroy()
@@ -289,10 +302,13 @@ class VioscWindow:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.pump_logs()
         self.poll_status()
+        self.poll_config()
         self.root.mainloop()
 
 
-def run_gui(daemon, cfg_path: str, sources: dict[str, str], base_values: dict[str, Any]) -> None:
-    """Open the viOSC window and block until it closes (e01s05)."""
+def run_gui(
+    daemon, cfg_path: str, sources: dict[str, str], base_values: dict[str, Any]
+) -> None:
+    """Open the viOSC dashboard and block until it closes (e58s02)."""
     window = VioscWindow(daemon, cfg_path, sources, base_values)
     window.run()
