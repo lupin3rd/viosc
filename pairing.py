@@ -44,6 +44,25 @@ def generate_code(length: int = DEFAULT_CODE_LENGTH) -> str:
     return f"{secrets.randbelow(10**length):0{length}d}"
 
 
+def persisted_code_if_valid(stored: object, length: int) -> str | None:
+    """Reuse ``stored`` only when it is a numeric string of exactly ``length``.
+
+    A persisted code that is empty, corrupt or no longer matches the configured
+    length returns None so the caller generates and persists a fresh one. This
+    is what makes a restart (os.execv) keep the same code instead of rotating it.
+    """
+    if not isinstance(stored, str) or not stored:
+        return None
+    try:
+        length = int(length)
+    except (TypeError, ValueError):
+        length = DEFAULT_CODE_LENGTH
+    length = max(MIN_CODE_LENGTH, min(MAX_CODE_LENGTH, length))
+    if len(stored) == length and stored.isdigit():
+        return stored
+    return None
+
+
 class PeerRegistry:
     """Who may talk to viOSC while pairing is on (e42s01).
 
@@ -150,6 +169,10 @@ class PairingGate:
     def code(self) -> str:
         """The current code (it changes when the global threshold regenerates it)."""
         return self._code
+
+    def set_code(self, code: str) -> None:
+        """Replace the code (a manual rotation from the daemon, e58s01)."""
+        self._code = str(code)
 
     def is_locked(self, ip: str) -> bool:
         """True while ``ip`` is locked out after too many failed attempts."""

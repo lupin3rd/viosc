@@ -30,7 +30,7 @@ from logbus import bus as log_bus
 from logbus import console_listener
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.5.0"
+APP_VERSION: str = "0.6.0"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666
@@ -188,13 +188,14 @@ def _on_pairing_code_regenerated(code: str) -> None:
     )
 
 
-def boot(values: dict[str, Any]) -> None:
+def boot(values: dict[str, Any], save_path: str | None = None) -> None:
     """Apply an effective config dict (config.effective) to the daemon state.
 
     Assigns every field to its module global, rebuilds the thumbnail
     semaphore (bound at boot) and recreates the OSC clients from the booted
     destinations. Call once in main() after load_effective, before starting
-    the servers.
+    the servers. ``save_path`` (the config file) makes a first-run pairing
+    code persistent: boot generates and writes it once, then reuses it.
     """
     global LISTEN_IP, LISTEN_PORT, LOCAL_BIND_IP, FROMVIMIX_PORT
     global PREVIEW_IP, PREVIEW_PORT, TOVIMIX_IP, TOVIMIX_PORT
@@ -228,7 +229,16 @@ def boot(values: dict[str, Any]) -> None:
     PAIRING_CODE_LENGTH = values["pairing_code_length"]
     PAIRING_LEASE_SECONDS = values["pairing_lease_seconds"]
     PAIRING_TRUSTED_PEERS = list(values["pairing_trusted_peers"])
-    PAIRING_CODE = pairing.generate_code(PAIRING_CODE_LENGTH) if PAIRING_ENABLED else ""
+    if PAIRING_ENABLED:
+        stored = values.get("pairing_code", "")
+        code = pairing.persisted_code_if_valid(stored, PAIRING_CODE_LENGTH)
+        if code is None:
+            code = pairing.generate_code(PAIRING_CODE_LENGTH)
+            if save_path is not None:
+                config.save_pairing_code(save_path, code)
+        PAIRING_CODE = code
+    else:
+        PAIRING_CODE = ""
     PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS, PAIRING_TRUSTED_PEERS)
     PAIRING_LOCK_AFTER = values["pairing_lock_after"]
     PAIRING_LOCK_SECONDS = values["pairing_lock_seconds"]
@@ -252,9 +262,87 @@ def boot(values: dict[str, Any]) -> None:
     _create_clients()
 
 
+def load_boot_config(config_arg: str | None) -> tuple[dict[str, Any], dict[str, str]]:
+    """Load the effective config and boot, persisting the pairing code (e58s01).
+
+    The code is written back to the SAME file boot() resolved, so a restart
+    (os.execv) re-reads the identical code instead of rotating it — the whole
+    point of the persisted code. main() must go through here, never boot()
+    directly, or a restart silently re-pairs. Returns (values, source markers).
+    """
+    cfg_path = config_arg or config.config_path()
+    values, sources, warnings = config.load_effective(cfg_path)
+    for warning in warnings:
+        log_bus.emit(warning)
+    boot(values, save_path=cfg_path)
+    return values, sources
+
+
+def rotate_pairing_code(save_path: str | None = None) -> str:
+    """Generate and persist a fresh code, updating the live gate (e58s01).
+
+    The operator asks for a new code; the daemon generates it, persists it (so
+    a restart keeps it) and updates the gate so the displayed code is the one
+    authentication accepts. With pairing disabled it clears the code and is a
+    no-op for persistence.
+    """
+    global PAIRING_CODE
+    if not PAIRING_ENABLED:
+        PAIRING_CODE = ""
+        return ""
+    code = pairing.generate_code(PAIRING_CODE_LENGTH)
+    PAIRING_CODE = code
+    if save_path is not None:
+        config.save_pairing_code(save_path, code)
+    PAIRING_GATE.set_code(code)
+    return code
+
+
+def _apply_live_field(key: str, value: Any) -> None:
+    """Set the daemon global for one live field and rebuild what depends on it."""
+    attr = config.daemon_attr(key)
+    globals()[attr] = value
+    if key in ("ui_ip", "reply_port", "tovimix_ip", "tovimix_port"):
+        _create_clients()
+
+
+def apply_config_changes(
+    changes: dict[str, Any], cfg_path: str | None = None
+) -> dict[str, Any]:
+    """Apply live fields now, persist every applied field (e58s01).
+
+    Classifies the change set; live fields are applied to the daemon state
+    immediately. EVERY applied field (live and restart/boot) is written back to
+    ``cfg_path`` — a live change that vanished on the next restart would be
+    surprising, and the dashboard's snapshot reads this file. Restart/boot
+    fields only take effect on the next launch, but they are persisted too.
+    Returns the full report:
+    ``{"applied": [...], "staged": [...], "invalid": {...}, "unknown": [...]}``.
+    """
+    classified = config.classify_changes(changes)
+    for key, value in classified["live"].items():
+        _apply_live_field(key, value)
+    staged = list(classified["restart"])
+    persisted = {**classified["live"], **classified["restart"]}
+    if cfg_path is not None and persisted:
+        config.merge_save(cfg_path, persisted)
+    return {
+        "applied": list(classified["live"]),
+        "staged": staged,
+        "invalid": classified["invalid"],
+        "unknown": classified["unknown"],
+        "local_only": classified["local_only"],
+    }
+
+
 MEDIA_META_CACHE: dict[
     str, dict[str, Any] | None
 ] = {}  # absolute path -> probe_media_meta result (cached once)
+
+# e57s01: the third media_kind value. A source is "other" when it has no file
+# (non-media classes) or its file has no video stream at all (audio-only,
+# broken): nothing can be thumbnailed and viseq draws the source name instead.
+MEDIA_KIND_OTHER = "other"
 
 # e01s04: Vimix-activity markers for the GUI status row — stamped on every
 # Vimix packet ingested from FROMVIMIX_PORT (no new OSC traffic).
@@ -265,6 +353,9 @@ vimix_messages: int = 0
 def create_empty_vimix_entry():
     entry = dict.fromkeys(SUPPORTED_PROPERTIES)
     entry["thumbnails"] = []
+    # e57s01: a source with no uri is "other" from its first state message; a
+    # media source flips to video/image when its uri answers (brief, accepted).
+    entry["media_kind"] = MEDIA_KIND_OTHER
     return entry
 
 
@@ -454,23 +545,37 @@ def probe_media_meta(file_path):
     return meta
 
 
-def publish_media_kind(idx, uri_value):
-    """Classify a media source (video|image) and broadcast the ADDITIVE
-    media_kind state key (e38s01). Non-media sources (no uri) and files that
-    are not present on disk stay unclassified (no key, no broadcast).
+def classify_media_kind(file_path) -> str:
+    """probe_media_meta + one retry, as video | image | other (e57s01).
+
+    A None probe (a readable file with no video stream: audio-only, broken)
+    drops the cached None and probes once more; a second None means "other" —
+    no thumbnail can be produced, and viseq is told so.
     """
-    if idx not in vimix_data or not uri_value:
-        return
-    file_path = clean_uri_path(uri_value)
-    if not os.path.exists(file_path):
-        return
     meta = probe_media_meta(file_path)
     if meta is None:
-        return
-    kind = meta["kind"]
+        MEDIA_META_CACHE.pop(file_path, None)
+        meta = probe_media_meta(file_path)
+    return meta["kind"] if meta else MEDIA_KIND_OTHER
+
+
+def publish_media_kind(idx, uri_value):
+    """Classify a media source (video|image|other) and broadcast the ADDITIVE
+    media_kind state key (e38s01, e57s01).
+
+    Returns the kind, or None when the entry/uri is missing or the file is not
+    present on disk (transient: keep the previous state, retried by the sync).
+    """
+    if idx not in vimix_data or not uri_value:
+        return None
+    file_path = clean_uri_path(uri_value)
+    if not os.path.exists(file_path):
+        return None
+    kind = classify_media_kind(file_path)
     if vimix_data[idx].get("media_kind") != kind:
         vimix_data[idx]["media_kind"] = kind
         schedule_state_broadcast()
+    return kind
 
 
 def generate_thumbnails_worker(idx, uri_value):
@@ -482,10 +587,21 @@ def generate_thumbnails_worker(idx, uri_value):
         )
         return  # keep the previous cache (if any); new sources stay empty
 
-    publish_media_kind(idx, file_path)  # e38s01: media_kind rides the state feed
+    # e57s01: probe FIRST — the kind decides whether and how much to extract.
+    kind = publish_media_kind(idx, file_path)
+    if kind is None:
+        return
+    if kind == MEDIA_KIND_OTHER:
+        if LOG_LEVEL >= 1:
+            log_bus.emit(
+                f"{COLOR_THUMB}[THUMB SKIP]{COLOR_RESET} Index {idx}: "
+                f"'{os.path.basename(file_path)}' has no video stream; no thumbnails"
+            )
+        return
 
+    count = THUMB_MAX_COUNT if kind == "video" else 1
     with thumb_semaphore:
-        thumbnails = extract_thumbnails_from_file(file_path, count=THUMB_MAX_COUNT)
+        thumbnails = extract_thumbnails_from_file(file_path, count=count)
     if idx in vimix_data:
         if thumbnails:
             vimix_data[idx]["thumbnails"] = thumbnails
@@ -638,6 +754,8 @@ def thumbnails_for(target_identifier):
     thumbnails = vimix_data[idx].get("thumbnails") or []
     if thumbnails:
         return thumbnails
+    if vimix_data[idx].get("media_kind") == MEDIA_KIND_OTHER:
+        return None  # e57s01: nothing can be produced, do not re-probe
     uri_value = vimix_data[idx].get("uri")
     if not uri_value:
         return None
@@ -976,10 +1094,11 @@ def create_osc_handler(server_port):
             )
             if idx is not None and idx in vimix_data:
                 uri_val = vimix_data[idx].get("uri")
-                if uri_val:
+                if uri_val and vimix_data[idx].get("media_kind") != MEDIA_KIND_OTHER:
                     # e10s01: do NOT wipe the cache before regenerating — the
                     # worker replaces it only on success, so a failed regen keeps
-                    # the previous good thumbnail.
+                    # the previous good thumbnail. (e57s01: an "other" source has
+                    # nothing to regenerate and is skipped.)
                     threading.Thread(
                         target=generate_thumbnails_worker, args=(idx, uri_val), daemon=True
                     ).start()
@@ -1219,10 +1338,7 @@ def main():
     gui_mode = not args.headless
     if not gui_mode:
         log_bus.subscribe(console_listener, replay=True)
-    values, _sources, warnings = config.load_effective(args.config)
-    for warning in warnings:
-        log_bus.emit(warning)
-    boot(values)
+    values, _sources = load_boot_config(args.config)
     try:
         verify_dependencies()
     except SystemExit:
@@ -1258,6 +1374,20 @@ def main():
         target=start_server_instance, args=(LOCAL_BIND_IP, FROMVIMIX_PORT), daemon=True
     ).start()
 
+    def _config_provider():
+        vals, srcs, _ = config.load_effective(args.config or config.config_path())
+        return {
+            "values": vals,
+            "sources": srcs,
+            "editable": config.remote_editable_fields(),
+        }
+
+    def _apply_config(changes):
+        return apply_config_changes(changes, args.config or config.config_path())
+
+    def _restart():
+        os.execv(sys.executable, restart_command())
+
     # e38s01: the HTTP preview surface is a separate daemon; a busy/missing
     # port degrades preview only — the OSC role keeps running. The server is
     # bound to THIS module's live state table and probe (the module runs as
@@ -1274,6 +1404,9 @@ def main():
             state_json,
             PAIRING_GATE,
             _FsAccess(),
+            provide_config=_config_provider,
+            apply_config=_apply_config,
+            restart=_restart,
         )
         threading.Thread(target=preview_server.serve_forever, daemon=True).start()
         if LOG_LEVEL >= 1:

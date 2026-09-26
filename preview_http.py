@@ -50,7 +50,15 @@ def resolve_media_path(name, vimix_data):
 
 
 def make_preview_handler(
-    vimix_data, probe_meta, resolve_thumb=None, provide_state=None, gate=None, fs=None
+    vimix_data,
+    probe_meta,
+    resolve_thumb=None,
+    provide_state=None,
+    gate=None,
+    fs=None,
+    provide_config=None,
+    apply_config=None,
+    restart=None,
 ):
     """Build a handler class bound to the daemon's live state table and probe.
 
@@ -66,6 +74,17 @@ def make_preview_handler(
     enabled, every request except ``POST /auth`` needs an
     ``Authorization: Bearer <token>`` header. It is injected exactly like the
     other collaborators so this module stays free of the daemon.
+
+    ``provide_config`` (e58s01) returns the effective config payload
+    (``{"values", "sources", "editable"}``) for the ``GET /config`` resource;
+    when absent the route answers 404.
+
+    ``apply_config`` (e58s01) accepts a ``POST /config`` change dict and returns
+    the ``{"applied", "staged", "invalid", "unknown"}`` report; when absent the
+    route answers 404.
+
+    ``restart`` (e58s01) is called by ``POST /restart`` after the 200 is flushed
+    (the daemon re-execs the process); when absent the route answers 404.
 
     ``fs`` (e43s01) is the optional read-only filesystem surface: an object with
     ``roots() -> list``, ``listing(path, offset) -> (payload, error)`` and
@@ -84,13 +103,25 @@ def make_preview_handler(
         # -- routing -------------------------------------------------------
 
         def do_POST(self):
-            """POST /auth (pairing) and POST /fs/session (write a .mix)."""
+            """POST /auth (pairing), POST /fs/session and POST /config (e58s01)."""
             route = urlparse(self.path).path
             if route == "/fs/session":
                 if not self._authorized():
                     self._send_unauthorized()
                     return
                 self._serve_fs_session_write()
+                return
+            if route == "/config":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_config_write()
+                return
+            if route == "/restart":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_restart()
                 return
             if route != "/auth" or gate is None or not gate.enabled:
                 self.send_error(404)
@@ -119,6 +150,9 @@ def make_preview_handler(
                 return
             if self.path.startswith("/fs/"):
                 self._serve_fs()
+                return
+            if self.path.startswith("/config"):
+                self._serve_config()
                 return
             if not self.path.startswith("/preview/"):
                 self.send_error(404)
@@ -207,6 +241,41 @@ def make_preview_handler(
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_config(self):
+            """The effective config + source markers + editable set (e58s01)."""
+            if provide_config is None:
+                self.send_error(404)
+                return
+            self._send_json(200, provide_config())
+
+        def _serve_config_write(self):
+            """POST /config: validate + apply, answering a per-field report (e58s01)."""
+            if apply_config is None:
+                self.send_error(404)
+                return
+            body = self._read_body(MAX_SESSION_BODY_BYTES)
+            try:
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    raise ValueError("body must be an object")
+            except (ValueError, TypeError):
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            report = apply_config(payload)
+            has_problems = bool(
+                report.get("invalid") or report.get("unknown") or report.get("local_only")
+            )
+            self._send_json(400 if has_problems else 200, report)
+
+        def _serve_restart(self):
+            """POST /restart: answer 200, flush, then re-exec (e58s01)."""
+            if restart is None:
+                self.send_error(404)
+                return
+            self._send_json(200, {"restarting": True})
+            self.wfile.flush()
+            restart()
 
         def _serve_thumb(self):
             """One cached thumbnail frame as JPEG (e41s03).
@@ -412,11 +481,29 @@ def make_preview_handler(
 
 
 def start_preview_server(
-    ip, port, vimix_data, probe_meta, resolve_thumb=None, provide_state=None, gate=None, fs=None
+    ip,
+    port,
+    vimix_data,
+    probe_meta,
+    resolve_thumb=None,
+    provide_state=None,
+    gate=None,
+    fs=None,
+    provide_config=None,
+    apply_config=None,
+    restart=None,
 ):
     """Bind (and return) the preview HTTP server against the daemon's state."""
     handler = make_preview_handler(
-        vimix_data, probe_meta, resolve_thumb, provide_state, gate, fs
+        vimix_data,
+        probe_meta,
+        resolve_thumb,
+        provide_state,
+        gate,
+        fs,
+        provide_config,
+        apply_config,
+        restart,
     )
 
     class PreviewServer(socketserver.ThreadingTCPServer):

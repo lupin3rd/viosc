@@ -36,8 +36,20 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "default": 7001,
         "attr": "FROMVIMIX_PORT",
     },
-    "preview_ip": {"group": "restart", "type": "ip", "default": "0.0.0.0", "attr": "PREVIEW_IP"},
-    "preview_port": {"group": "restart", "type": "port", "default": 8686, "attr": "PREVIEW_PORT"},
+    "preview_ip": {
+        "group": "restart",
+        "type": "ip",
+        "default": "0.0.0.0",
+        "attr": "PREVIEW_IP",
+        "local_only": True,
+    },
+    "preview_port": {
+        "group": "restart",
+        "type": "port",
+        "default": 8686,
+        "attr": "PREVIEW_PORT",
+        "local_only": True,
+    },
     # Group B — live apply (client destinations + per-use knobs)
     "tovimix_ip": {"group": "live", "type": "ip", "default": "127.0.0.1", "attr": "TOVIMIX_IP"},
     "tovimix_port": {"group": "live", "type": "port", "default": 7000, "attr": "TOVIMIX_PORT"},
@@ -117,6 +129,14 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "default": 20,
         "attr": "PAIRING_GLOBAL_LOCK_AFTER",
     },
+    # e58s01: the persisted pairing code (generated once, rotated manually).
+    # Empty is the "not yet generated" sentinel; boot() resolves it.
+    "pairing_code": {
+        "group": "boot",
+        "type": "code",
+        "default": "",
+        "attr": "PAIRING_CODE",
+    },
     # e43s01: the read-only /fs media browser (machine A). fs_roots is the
     # allow-list every requested path must resolve inside; fs_sessions_dir is the
     # only directory the .mix writer may touch (e43s06).
@@ -157,11 +177,11 @@ VISIBILITY: dict[str, str] = {
     "listen_ip": "advanced",
     "listen_port": "essential",
     "local_bind_ip": "hidden",
-    "from_vimix_port": "essential",
+    "from_vimix_port": "hidden",
     "preview_ip": "advanced",
     "preview_port": "essential",
     "tovimix_ip": "hidden",
-    "tovimix_port": "essential",
+    "tovimix_port": "hidden",
     "ui_ip": "essential",
     "reply_port": "essential",
     "ffmpeg_path": "hidden",
@@ -179,6 +199,7 @@ VISIBILITY: dict[str, str] = {
     "pairing_lock_after": "hidden",
     "pairing_lock_seconds": "hidden",
     "pairing_global_lock_after": "hidden",
+    "pairing_code": "hidden",
     "fs_roots": "advanced",
     "fs_show_hidden": "advanced",
     "fs_page_size": "hidden",
@@ -199,6 +220,26 @@ def essential_fields() -> list[str]:
 def advanced_fields() -> list[str]:
     """Less common ports and knobs behind the 'Advanced settings' toggle."""
     return fields("advanced")
+
+
+def remote_editable_fields() -> list[str]:
+    """Field names a remote client may edit (e58s01).
+
+    The hidden tier (Vimix-local ports, ffmpeg paths, internal tuning) stays
+    readable in the effective config but is never offered as editable — the
+    remote surface must not let a UI rewrite machine-A-local settings. The
+    local-only management bind (e58s02) is likewise excluded.
+    """
+    return [
+        k
+        for k in FIELD_SPEC
+        if VISIBILITY.get(k) != "hidden" and not FIELD_SPEC[k].get("local_only", False)
+    ]
+
+
+def local_only_fields() -> list[str]:
+    """Fields editable only on machine A (the management bind, e58s02)."""
+    return [k for k in FIELD_SPEC if FIELD_SPEC[k].get("local_only", False)]
 
 
 def daemon_attr(key: str) -> str:
@@ -259,6 +300,8 @@ def is_valid_value(key: str, value: Any) -> bool:
         )
     if vtype in ("ip", "path"):
         return isinstance(value, str) and bool(value.strip())
+    if vtype == "code":
+        return isinstance(value, str) and (value == "" or value.isdigit())
     return False
 
 
@@ -271,6 +314,42 @@ def validate(values: dict[str, Any]) -> list[str]:
         elif not is_valid_value(key, value):
             problems.append(f"invalid value for '{key}': {value!r}")
     return problems
+
+
+def classify_changes(changes: dict[str, Any]) -> dict[str, Any]:
+    """Split a change set into live / restart / invalid / unknown (e58s01).
+
+    A POST /config payload is classified before anything is applied: a live
+    field applies immediately, a restart/boot field is staged for the next
+    launch, an invalid value is rejected per-field, and an unknown key is
+    reported — never silently dropped.
+    """
+    live: dict[str, Any] = {}
+    restart: dict[str, Any] = {}
+    invalid: dict[str, Any] = {}
+    unknown: list[str] = []
+    local_only: list[str] = []
+    for key, value in changes.items():
+        if key not in FIELD_SPEC:
+            unknown.append(key)
+            continue
+        if FIELD_SPEC[key].get("local_only", False):
+            local_only.append(key)
+            continue
+        if not is_valid_value(key, value):
+            invalid[key] = value
+            continue
+        if FIELD_SPEC[key]["group"] == "live":
+            live[key] = value
+        else:
+            restart[key] = value
+    return {
+        "live": live,
+        "restart": restart,
+        "invalid": invalid,
+        "unknown": unknown,
+        "local_only": local_only,
+    }
 
 
 def parse_form(
@@ -363,6 +442,8 @@ def _coerce(key: str, raw: Any) -> Any:
     if vtype == "list":
         return _to_list(raw)
     if vtype in ("ip", "path"):
+        return raw if isinstance(raw, str) else None
+    if vtype == "code":
         return raw if isinstance(raw, str) else None
     return None
 
@@ -486,8 +567,48 @@ def save(path: str, values: dict[str, Any]) -> None:
         raise
 
 
+def merge_save(path: str, changes: dict[str, Any]) -> None:
+    """Merge ``changes`` over the existing file (preserving other keys) and save.
+
+    Used to stage restart-group fields without materialising the whole effective
+    config (which would pin env-provided values into JSON).
+    """
+    base: dict[str, Any] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                base = loaded
+        except (OSError, json.JSONDecodeError):
+            base = {}
+    base.update(changes)
+    save(path, base)
+
+
 def config_path(env=None) -> str:
     """$XDG_CONFIG_HOME|~/.config + viosc/config.json (user decision d1)."""
     env = os.environ if env is None else env
     base = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", ""), ".config")
     return os.path.join(base, "viosc", "config.json")
+
+
+def save_pairing_code(path: str, code: str) -> None:
+    """Persist only the ``pairing_code`` key, preserving every other key (e58s01).
+
+    boot() generates a code on first run and must write it back without
+    materialising the whole effective config (which would pin env-provided
+    values into JSON). This merges the single key over whatever the file
+    already holds, then reuses the atomic ``save``.
+    """
+    base: dict[str, Any] = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                base = loaded
+        except (OSError, json.JSONDecodeError):
+            base = {}
+    base["pairing_code"] = code
+    save(path, base)
