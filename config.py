@@ -367,8 +367,7 @@ def parse_form(
     base = DEFAULTS if base is None else base
     problems = []
     values: dict[str, Any] = {
-        key: (list(value) if isinstance(value, list) else value)
-        for key, value in base.items()
+        key: (list(value) if isinstance(value, list) else value) for key, value in base.items()
     }
     for key, text in raw.items():
         if key not in FIELD_SPEC:
@@ -499,8 +498,7 @@ def effective(
     """
     env = os.environ if env is None else env
     values: dict[str, Any] = {
-        key: (list(value) if isinstance(value, list) else value)
-        for key, value in DEFAULTS.items()
+        key: (list(value) if isinstance(value, list) else value) for key, value in DEFAULTS.items()
     }
     sources: dict[str, str] = dict.fromkeys(DEFAULTS, "default")
     warnings: list[str] = []

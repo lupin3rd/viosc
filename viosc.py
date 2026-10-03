@@ -30,7 +30,7 @@ from logbus import bus as log_bus
 from logbus import console_listener
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.6.0"
+APP_VERSION: str = "0.7.0"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666
@@ -127,7 +127,7 @@ PRUNE_DELAY_SEC = 0.5
 # e41s01: STATE BROADCAST COALESCING. broadcast_vimix_state() used to run on
 # EVERY changed property (8 call sites), so one monitor round over N sources x
 # M properties could cost up to N*M whole-table JSON serializations, each one
-# taxing the consumer's UI (viseq: 0.12-2.6 ms per push, SPIKE-perf). Changes
+# taxing the consumer's UI (VJmix: 0.12-2.6 ms per push, SPIKE-perf). Changes
 # inside one window now collapse into a single send: the FIRST change of a burst
 # goes out immediately (leading edge, so the common single change is never
 # delayed) and the rest wait for the trailing flush, which the sync loop runs.
@@ -182,8 +182,7 @@ def _on_pairing_code_regenerated(code: str) -> None:
     global PAIRING_CODE
     PAIRING_CODE = code
     log_bus.emit(
-        f"{COLOR_RESET_EV}[PAIRING]{COLOR_RESET} too many failed attempts — "
-        f"new code {code}",
+        f"{COLOR_RESET_EV}[PAIRING]{COLOR_RESET} too many failed attempts — new code {code}",
         "error",
     )
 
@@ -306,9 +305,7 @@ def _apply_live_field(key: str, value: Any) -> None:
         _create_clients()
 
 
-def apply_config_changes(
-    changes: dict[str, Any], cfg_path: str | None = None
-) -> dict[str, Any]:
+def apply_config_changes(changes: dict[str, Any], cfg_path: str | None = None) -> dict[str, Any]:
     """Apply live fields now, persist every applied field (e58s01).
 
     Classifies the change set; live fields are applied to the daemon state
@@ -341,7 +338,7 @@ MEDIA_META_CACHE: dict[
 
 # e57s01: the third media_kind value. A source is "other" when it has no file
 # (non-media classes) or its file has no video stream at all (audio-only,
-# broken): nothing can be thumbnailed and viseq draws the source name instead.
+# broken): nothing can be thumbnailed and VJmix draws the source name instead.
 MEDIA_KIND_OTHER = "other"
 
 # e01s04: Vimix-activity markers for the GUI status row — stamped on every
@@ -550,7 +547,7 @@ def classify_media_kind(file_path) -> str:
 
     A None probe (a readable file with no video stream: audio-only, broken)
     drops the cached None and probes once more; a second None means "other" —
-    no thumbnail can be produced, and viseq is told so.
+    no thumbnail can be produced, and VJmix is told so.
     """
     meta = probe_media_meta(file_path)
     if meta is None:
@@ -1358,9 +1355,7 @@ def main():
     log_bus.emit(f"   output  : {UI_IP}:{REPLY_PORT}   (state / thumbnails / monitor for the UI)")
     log_bus.emit(f"   preview : {PREVIEW_IP}:{PREVIEW_PORT}   (HTTP file/meta transport, e38s01)")
     if PAIRING_ENABLED:
-        log_bus.emit(
-            f"   pairing : code {PAIRING_CODE}   (pairing ON — enter this code in the UI)"
-        )
+        log_bus.emit(f"   pairing : code {PAIRING_CODE}   (pairing ON — enter this code in the UI)")
     log_bus.emit(
         "=========================================================================================="
     )

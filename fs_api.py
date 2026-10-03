@@ -1,6 +1,6 @@
 """Read-only filesystem surface for the viOSC data plane (e43s01).
 
-The file manager in viseq browses machine A through HTTP; this module is the
+The file manager in VJmix browses machine A through HTTP; this module is the
 pure, daemon-free half: Media Roots expansion and realpath containment, media
 classification by **vimix's own extension list**, directory listing (hidden
 filter, paging, dirs-first order, readable flags) and the file resolver behind
@@ -144,11 +144,7 @@ def list_directory(
         names = os.listdir(directory)
     except OSError:
         return None, "unreadable"
-    entries = [
-        _entry(directory, name)
-        for name in names
-        if show_hidden or not name.startswith(".")
-    ]
+    entries = [_entry(directory, name) for name in names if show_hidden or not name.startswith(".")]
     entries.sort(key=lambda e: (e["kind"] != KIND_DIR, e["name"].lower()))
     total = len(entries)
     try:

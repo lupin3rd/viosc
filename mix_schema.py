@@ -378,11 +378,7 @@ def write_session(
         os.makedirs(directory, exist_ok=True)
     except OSError:
         return None, "unwritable"
-    path = (
-        os.path.join(directory, filename)
-        if overwrite
-        else _unique_path(directory, filename)
-    )
+    path = os.path.join(directory, filename) if overwrite else _unique_path(directory, filename)
     text = build_session(wanted, alphas=alphas)
     try:
         tmp = f"{path}.tmp"
