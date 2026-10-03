@@ -5,7 +5,7 @@ GUI-free by construction. The window is a thin front-end over the live daemon
 module (injected as ``daemon`` — never imported by name, avoiding the
 ``__main__`` double-import trap):
 
-- the pairing code large (the operator reads it to pair viSeq),
+- the pairing code large (the operator reads it to pair VJmix),
 - connection statistics (source count, Vimix last-seen, message counts),
 - the LOCAL bind fields (preview_ip/preview_port) — the only editable inputs,
   applied locally via a same-pid restart (the management plane must never be
@@ -13,7 +13,7 @@ module (injected as ``daemon`` — never imported by name, avoiding the
 - a READ-ONLY snapshot of the effective config with per-field source markers,
   and a live log pane with timestamps and an All/Errors filter.
 
-Everything else is configured from viSeq over HTTP /config (e58s01). GUI mode is
+Everything else is configured from VJmix over HTTP /config (e58s01). GUI mode is
 the whole app: nothing is printed to the terminal. Closing the window ends the
 process.
 """
@@ -65,8 +65,7 @@ def render_snapshot(values: dict[str, Any], sources: dict[str, str]) -> str:
     (json/env/default) explains where each value came from.
     """
     return "\n".join(
-        f"{key} = {config.format_field(key, values[key])} "
-        f"({sources.get(key, 'default')})"
+        f"{key} = {config.format_field(key, values[key])} ({sources.get(key, 'default')})"
         for key in sorted(values)
     )
 
@@ -105,9 +104,7 @@ class VioscWindow:
 
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 2))
-        ttk.Label(header, text="viOSC", font=("TkDefaultFont", 12, "bold")).pack(
-            side="left"
-        )
+        ttk.Label(header, text="viOSC", font=("TkDefaultFont", 12, "bold")).pack(side="left")
         version = getattr(self.daemon, "APP_VERSION", "")
         if version:
             ttk.Label(header, text=f"v{version}", foreground="#666666").pack(
@@ -133,9 +130,7 @@ class VioscWindow:
         ttk.Label(footer, textvariable=self.status_var).pack(side="left")
 
         self.error_var = tk.StringVar()
-        ttk.Label(outer, textvariable=self.error_var, foreground="#c00000").pack(
-            anchor="w"
-        )
+        ttk.Label(outer, textvariable=self.error_var, foreground="#c00000").pack(anchor="w")
 
     def _build_bind(self, outer) -> None:
         frame = ttk.LabelFrame(outer, text="Local bind (machine A only)", padding=4)
@@ -159,7 +154,7 @@ class VioscWindow:
         )
         ttk.Label(
             outer,
-            text="Everything else is configured from viSeq (Settings > viOSC).",
+            text="Everything else is configured from VJmix (Settings > viOSC).",
             foreground="#666666",
         ).pack(anchor="w", pady=(0, 2))
 
@@ -273,7 +268,7 @@ class VioscWindow:
     def poll_config(self) -> None:
         """Re-render the snapshot when the on-disk config changed (e58s02).
 
-        The config file is the single source of truth (a save from viSeq already
+        The config file is the single source of truth (a save from VJmix already
         persists every applied field), so a periodic re-read keeps the dashboard
         honest without a cross-thread GUI call from the HTTP handler.
         """
@@ -306,9 +301,7 @@ class VioscWindow:
         self.root.mainloop()
 
 
-def run_gui(
-    daemon, cfg_path: str, sources: dict[str, str], base_values: dict[str, Any]
-) -> None:
+def run_gui(daemon, cfg_path: str, sources: dict[str, str], base_values: dict[str, Any]) -> None:
     """Open the viOSC dashboard and block until it closes (e58s02)."""
     window = VioscWindow(daemon, cfg_path, sources, base_values)
     window.run()
