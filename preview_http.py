@@ -16,15 +16,71 @@ resolver when the server starts, so resolution always sees the daemon's real
 state.
 """
 
+import contextlib
 import http.server
 import json
 import os
+import queue
 import socketserver
+import threading
 from urllib.parse import parse_qs, unquote, urlparse
 
 CHUNK = 65536  # bytes per write while streaming a file body
 MAX_AUTH_BODY_BYTES = 4096  # POST /auth body cap (a 4-digit code is tiny)
 MAX_SESSION_BODY_BYTES = 262144  # POST /fs/session: a request carries up to 256 paths
+
+# e82s03: the delta stream. A comment line every SSE_HEARTBEAT_S keeps an idle
+# connection alive through NAT/proxies; EVENT_QUEUE_MAX bounds one subscriber's
+# backlog (an overflow is a RESYNC signal, never silent loss).
+SSE_HEARTBEAT_S = 15.0
+EVENT_QUEUE_MAX = 256
+
+
+class EventHub:
+    """Fan-out of mirror changes to the SSE clients (e82s03).
+
+    One bounded queue per subscriber. A client that stops reading gets an
+    ``{"kind": "overflow"}`` marker instead of a silent gap: the consumer refetches
+    ``/state`` and continues, which is the contract the revision number exists for.
+    """
+
+    def __init__(self, maxsize=EVENT_QUEUE_MAX, on_subscribe=None):
+        self._lock = threading.Lock()
+        self._subscribers = []
+        self._maxsize = maxsize
+        # e82s06: a stream consumer reads over HTTP by definition, so opening the
+        # stream is the daemon's cue to stop broadcasting (the callback arms the
+        # lane; the hub itself stays transport-only).
+        self._on_subscribe = on_subscribe
+
+    def subscribe(self):
+        channel = queue.Queue(maxsize=self._maxsize)
+        with self._lock:
+            self._subscribers.append(channel)
+        if self._on_subscribe is not None:
+            self._on_subscribe()
+        return channel
+
+    def unsubscribe(self, channel):
+        with self._lock:
+            if channel in self._subscribers:
+                self._subscribers.remove(channel)
+
+    def publish(self, event):
+        with self._lock:
+            subscribers = list(self._subscribers)
+        for channel in subscribers:
+            try:
+                channel.put_nowait(event)
+            except queue.Full:
+                with contextlib.suppress(queue.Empty):
+                    channel.get_nowait()
+                with contextlib.suppress(queue.Full):
+                    channel.put_nowait({"kind": "overflow"})
+
+    def count(self):
+        with self._lock:
+            return len(self._subscribers)
 
 
 def clean_media_path(uri_value):
@@ -59,6 +115,11 @@ def make_preview_handler(
     provide_config=None,
     apply_config=None,
     restart=None,
+    provide_rev=None,
+    events=None,
+    apply_interest=None,
+    regen_thumb=None,
+    apply_lane=None,
 ):
     """Build a handler class bound to the daemon's live state table and probe.
 
@@ -90,6 +151,12 @@ def make_preview_handler(
     ``roots() -> list``, ``listing(path, offset) -> (payload, error)`` and
     ``resolve_file(path) -> str | None``. When it is absent (an older daemon) the
     ``/fs`` routes answer 404.
+
+    ``provide_rev`` (e82s03) answers the mirror revision that validates ``/state``
+    with an ETag; ``events`` is the ``EventHub`` behind ``/events``; ``apply_interest``,
+    ``regen_thumb`` and ``apply_lane`` are the daemon's handlers for the three POST
+    routes of the same epic. Every one of them is OPTIONAL: absent, the route answers
+    404, which is how a new consumer detects an older daemon.
     """
 
     class BoundPreviewHandler(http.server.BaseHTTPRequestHandler):
@@ -123,6 +190,24 @@ def make_preview_handler(
                     return
                 self._serve_restart()
                 return
+            if route == "/interest":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_interest()
+                return
+            if route == "/thumb/regen":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_thumb_regen()
+                return
+            if route == "/lane":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_lane()
+                return
             if route != "/auth" or gate is None or not gate.enabled:
                 self.send_error(404)
                 return
@@ -147,6 +232,9 @@ def make_preview_handler(
                 return
             if self.path.startswith("/state"):
                 self._serve_state()
+                return
+            if self.path.startswith("/events"):
+                self._serve_events()
                 return
             if self.path.startswith("/fs/"):
                 self._serve_fs()
@@ -235,12 +323,109 @@ def make_preview_handler(
             if provide_state is None:
                 self.send_error(404)
                 return
+            etag = None
+            if provide_rev is not None:
+                etag = f'"{provide_rev()}"'
+                if self.headers.get("If-None-Match") == etag:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
             body = provide_state().encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if etag is not None:
+                self.send_header("ETag", etag)
             self.end_headers()
             self.wfile.write(body)
+
+        def _serve_events(self):
+            """The delta stream: one persistent connection, ordered by `rev` (e82s03).
+
+            The handler is the ONLY long-lived loop in this server (a thread per
+            client, which ThreadingTCPServer already gives us). It has no length:
+            HTTP/1.1 unbounded responses use CHUNKED framing, and without it a
+            stdlib/urllib client closes the connection as soon as it has the headers.
+            """
+            if events is None:
+                self.send_error(404)
+                return
+            channel = events.subscribe()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self._write_sse(": connected\n\n")
+                while True:
+                    try:
+                        event = channel.get(timeout=SSE_HEARTBEAT_S)
+                    except queue.Empty:
+                        self._write_sse(": ping\n\n")
+                        continue
+                    payload = json.dumps(event)
+                    head = f"id: {event['rev']}\n" if "rev" in event else ""
+                    self._write_sse(f"{head}event: delta\ndata: {payload}\n\n")
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                events.unsubscribe(channel)
+                self.close_connection = True
+
+        def _write_sse(self, text):
+            """One chunked Server-Sent-Event frame (many lines, ONE chunk)."""
+            body = text.encode("utf-8")
+            self.wfile.write(f"{len(body):x}\r\n".encode("ascii") + body + b"\r\n")
+            self.wfile.flush()
+
+        def _read_json(self, max_bytes=MAX_SESSION_BODY_BYTES):
+            """The POST body as a dict, or None when it is not a JSON object."""
+            body = self._read_body(max_bytes)
+            try:
+                payload = json.loads(body)
+            except (ValueError, TypeError):
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        def _serve_interest(self):
+            """Apply one interest declaration and answer its per-field report (e82s03)."""
+            if apply_interest is None:
+                self.send_error(404)
+                return
+            payload = self._read_json()
+            if payload is None:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            report = apply_interest(payload)
+            problems = bool(report.get("invalid") or report.get("unknown"))
+            self._send_json(400 if problems else 200, report)
+
+        def _serve_thumb_regen(self):
+            """Regenerate one source's thumbnails (e82s03). 404 = nothing to do."""
+            if regen_thumb is None:
+                self.send_error(404)
+                return
+            payload = self._read_json()
+            if payload is None:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            regenerated = bool(regen_thumb(payload.get("source")))
+            self._send_json(200 if regenerated else 404, {"regenerated": regenerated})
+
+        def _serve_lane(self):
+            """Declare that the consumer reads over HTTP (e82s03)."""
+            if apply_lane is None:
+                self.send_error(404)
+                return
+            payload = self._read_json()
+            if payload is None:
+                self._send_json(400, {"error": "invalid JSON body"})
+                return
+            self._send_json(200, apply_lane(payload))
 
         def _serve_config(self):
             """The effective config + source markers + editable set (e58s01)."""
@@ -492,6 +677,11 @@ def start_preview_server(
     provide_config=None,
     apply_config=None,
     restart=None,
+    provide_rev=None,
+    events=None,
+    apply_interest=None,
+    regen_thumb=None,
+    apply_lane=None,
 ):
     """Bind (and return) the preview HTTP server against the daemon's state."""
     handler = make_preview_handler(
@@ -504,6 +694,11 @@ def start_preview_server(
         provide_config,
         apply_config,
         restart,
+        provide_rev=provide_rev,
+        events=events,
+        apply_interest=apply_interest,
+        regen_thumb=regen_thumb,
+        apply_lane=apply_lane,
     )
 
     class PreviewServer(socketserver.ThreadingTCPServer):
