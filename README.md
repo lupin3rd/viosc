@@ -85,9 +85,9 @@ bash scripts/verify_appimage.sh         # layout + headless smoke
 ```
 
 Run it like the source version (GUI by default, `--headless` for the console
-daemon). Note: the AppImage bundles a **GPL-licensed static ffmpeg/ffprobe**
-as separate executables invoked via subprocess — viOSC's own MIT license is
-not affected (same boundary as installing ffmpeg with apt today).
+daemon). Note: viOSC is **GPL-3.0**; the static ffmpeg/ffprobe it bundles are
+separate executables under their own GPL license, invoked via subprocess (the
+same boundary as installing ffmpeg with apt today).
 
 ---
 
