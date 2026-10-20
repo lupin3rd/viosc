@@ -322,6 +322,15 @@ Full state broadcast, sent whenever a value changes (and at start-up/prune). Sin
 
 ---
 
+## Support
+
+viOSC is free and GPL-3.0. If it is useful to you, you can buy me a coffee -
+a thank-you, never a requirement.
+
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/lupin3rd)
+
+---
+
 ## License
 
 This project is licensed under the [GNU General Public License v3.0](https://www.gnu.org/licenses/gpl-3.0.html) (GPL-3.0).
