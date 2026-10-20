@@ -17,6 +17,7 @@ import hmac
 import secrets
 import time
 from collections.abc import Callable
+from typing import Any
 
 MIN_CODE_LENGTH = 1
 MAX_CODE_LENGTH = 12
@@ -42,6 +43,24 @@ def generate_code(length: int = DEFAULT_CODE_LENGTH) -> str:
         length = DEFAULT_CODE_LENGTH
     length = max(MIN_CODE_LENGTH, min(MAX_CODE_LENGTH, length))
     return f"{secrets.randbelow(10**length):0{length}d}"
+
+
+def code_is_fresh(created_at: Any, ttl_hours: Any, now: float) -> bool:
+    """True when a persisted code is still inside its TTL (BUG-2026-10-18).
+
+    A code written by an older viOSC has no timestamp: it is treated as EXPIRED,
+    so the first boot of the new version rotates it (the upgrade path).
+    """
+    try:
+        ttl_seconds = max(0, int(ttl_hours)) * 3600
+        created = float(created_at)
+    except (TypeError, ValueError):
+        return False
+    if ttl_seconds <= 0:
+        return True
+    if created <= 0:
+        return False
+    return (float(now) - created) < ttl_seconds
 
 
 def persisted_code_if_valid(stored: object, length: int) -> str | None:
@@ -149,6 +168,8 @@ class PairingGate:
         lock_seconds: float = DEFAULT_LOCK_SECONDS,
         global_lock_after: int = DEFAULT_GLOBAL_LOCK_AFTER,
         on_regenerate: Callable[[str], None] | None = None,
+        code_ttl_seconds: float = 0.0,
+        code_created_at: float | None = None,
     ) -> None:
         self.enabled = bool(enabled)
         self._code = str(code)
@@ -160,6 +181,11 @@ class PairingGate:
         self._lock_seconds = max(0.0, float(lock_seconds))
         self._global_lock_after = max(1, int(global_lock_after))
         self._on_regenerate = on_regenerate
+        # BUG-2026-10-18: a durable 4-digit secret is a durable credential. The
+        # TTL is enforced HERE, at every auth attempt (no timer thread), and the
+        # boundary between "fresh" and "expired" is the SAME rule boot() applies.
+        self._code_ttl = max(0.0, float(code_ttl_seconds))
+        self._code_created_at = self._clock() if code_created_at is None else float(code_created_at)
         self._failures: dict[str, int] = {}
         self._locked_until: dict[str, float] = {}
         self._global_failures: list[float] = []
@@ -170,9 +196,30 @@ class PairingGate:
         """The current code (it changes when the global threshold regenerates it)."""
         return self._code
 
-    def set_code(self, code: str) -> None:
+    def set_code(self, code: str, created_at: float | None = None) -> None:
         """Replace the code (a manual rotation from the daemon, e58s01)."""
         self._code = str(code)
+        self._code_created_at = self._clock() if created_at is None else float(created_at)
+
+    @property
+    def code_created_at(self) -> float:
+        """When the live code was generated (epoch seconds; the daemon persists it)."""
+        return self._code_created_at
+
+    def _regenerate_code(self) -> None:
+        """Generate a new code, reset its clock and tell the daemon (BUG-2026-10-18)."""
+        self._code_created_at = self._clock()
+        self._code = generate_code(len(self._code) or DEFAULT_CODE_LENGTH)
+        if self._on_regenerate is not None:
+            self._on_regenerate(self._code)
+
+    def _maybe_expire_code(self) -> None:
+        """Rotate the code when its TTL has elapsed — checked on every auth."""
+        if self._code_ttl <= 0:
+            return
+        if self._clock() - self._code_created_at < self._code_ttl:
+            return
+        self._regenerate_code()
 
     def is_locked(self, ip: str) -> bool:
         """True while ``ip`` is locked out after too many failed attempts."""
@@ -204,15 +251,14 @@ class PairingGate:
         if len(self._global_failures) >= self._global_lock_after:
             self._global_failures.clear()
             self._frozen_until = now + self._lock_seconds
-            self._code = generate_code(len(self._code) or DEFAULT_CODE_LENGTH)
-            if self._on_regenerate is not None:
-                self._on_regenerate(self._code)
+            self._regenerate_code()
 
     def authenticate(self, code: object, ip: str) -> str | None:
         """HTTP auth: a bearer token on the right code, else None (binds ``ip``)."""
         if not self.enabled:
             self._registry.bind(ip)
             return ""
+        self._maybe_expire_code()
         if self.is_locked(ip) or self.is_frozen():
             return None
         if not self._code_matches(code):
@@ -229,6 +275,7 @@ class PairingGate:
         if not self.enabled:
             self._registry.bind(ip)
             return True
+        self._maybe_expire_code()
         if self.is_locked(ip) or self.is_frozen():
             return False
         if not self._code_matches(code):

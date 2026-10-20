@@ -98,6 +98,15 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "default": 4,
         "attr": "PAIRING_CODE_LENGTH",
     },
+    # BUG-2026-10-18: the code's lifetime. A 4-digit secret that never expires is
+    # a durable credential; boot reuses the persisted code only inside this TTL
+    # and the live gate rotates it when it elapses.
+    "pairing_code_ttl_hours": {
+        "group": "boot",
+        "type": "count",
+        "default": 24,
+        "attr": "PAIRING_CODE_TTL_HOURS",
+    },
     "pairing_lease_seconds": {
         "group": "live",
         "type": "seconds",
@@ -136,6 +145,12 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "type": "code",
         "default": "",
         "attr": "PAIRING_CODE",
+    },
+    "pairing_code_created_at": {
+        "group": "boot",
+        "type": "seconds",
+        "default": 0,
+        "attr": "PAIRING_CODE_CREATED_AT",
     },
     # e43s01: the read-only /fs media browser (machine A). fs_roots is the
     # allow-list every requested path must resolve inside; fs_sessions_dir is the
@@ -200,6 +215,8 @@ VISIBILITY: dict[str, str] = {
     "pairing_lock_seconds": "hidden",
     "pairing_global_lock_after": "hidden",
     "pairing_code": "hidden",
+    "pairing_code_ttl_hours": "advanced",
+    "pairing_code_created_at": "hidden",
     "fs_roots": "advanced",
     "fs_show_hidden": "advanced",
     "fs_page_size": "hidden",
@@ -591,13 +608,15 @@ def config_path(env=None) -> str:
     return os.path.join(base, "viosc", "config.json")
 
 
-def save_pairing_code(path: str, code: str) -> None:
-    """Persist only the ``pairing_code`` key, preserving every other key (e58s01).
+def save_pairing_code(path: str, code: str, created_at: float | None = None) -> None:
+    """Persist the code AND when it was made, preserving every other key (e58s01).
 
     boot() generates a code on first run and must write it back without
     materialising the whole effective config (which would pin env-provided
     values into JSON). This merges the single key over whatever the file
-    already holds, then reuses the atomic ``save``.
+    already holds, then reuses the atomic ``save``. ``created_at`` (epoch
+    seconds, BUG-2026-10-18) is what makes a persisted code EXPIRE: without it a
+    restart could not tell a fresh code from a month-old one.
     """
     base: dict[str, Any] = {}
     if os.path.isfile(path):
@@ -609,4 +628,5 @@ def save_pairing_code(path: str, code: str) -> None:
         except (OSError, json.JSONDecodeError):
             base = {}
     base["pairing_code"] = code
+    base["pairing_code_created_at"] = float(created_at) if created_at is not None else 0.0
     save(path, base)

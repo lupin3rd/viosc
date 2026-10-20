@@ -2,12 +2,15 @@
 
 **viOSC** is an OSC router, state mirror and monitoring layer for [Vimix](https://github.com/brunoherbelin/vimix), the live-mixing VJ software. It runs on the same machine as Vimix, talks to it over localhost using Vimix's **default OSC ports** (no Vimix configuration required), and exposes a small OSC API for an external UI/controller.
 
-It keeps an up-to-date table of Vimix source properties in memory and pushes it to your UI:
+It keeps an up-to-date table of Vimix source properties in memory and serves it over HTTP (0.8.0):
 
-- **Base table** — every source's `name` and `alpha`, refreshed every 2 seconds from Vimix's sync bundle, with automatic removal of sources that no longer exist.
-- **Thumbnails** — for every media source: the `uri` is fetched once (on discovery) and a random JPEG frame (10%–90% of the video) is generated locally with FFmpeg.
-- **On-demand monitoring** — tell viOSC to poll any property of any source (`depth`, `play`, `position`, …) every 2 seconds, and the values land in the table automatically.
+- **Base table** — every source's `name` and `alpha`, refreshed from Vimix's sync bundle, with automatic removal of sources that no longer exist. Since 0.8.0 a **state tier** (`id`, `index`, `name`, `alpha`, `blending`, `correction`, `depth`, `position`, `size`, `angle`, `play`, `lock`, `speed`, `seek`) is polled with **one `get` per source per second**, for every source; a session change (`/vimix/session/open`) triggers an immediate refresh instead of waiting for the tick. The discovery keys `uri`, `type`, `media_kind` and `duration_s` ride the same payload.
+- **Snapshot + delta stream** — `GET /state` (with `rev` and an `ETag`/`304`) for the whole table, `GET /events` (Server-Sent Events) for one ordered delta per change. A revision gap means: refetch the snapshot.
+- **Interest** — `POST /interest` declares what a consumer needs (`{source, props, cadence_ms}`; `*` for the full mirror). It replaces the per-subscriber watch/monitor polling for HTTP clients.
+- **Echo** — a forwarded `/vimix/<target>/<prop>` set **without a `ms` duration** is applied to the mirror as it passes through, so the consumer's own writes are never stale.
+- **Thumbnails** — for every media source: the `uri` is fetched once (on discovery) and a random JPEG frame (10%–90% of the video) is generated locally with FFmpeg; `GET /thumb/<name>/<index>`, `POST /thumb/regen`.
 - **Name-based addressing** — commands target sources by **name** (stable across reordering/removal), while indices are only used internally to parse Vimix's replies.
+- **OSC only where Vimix is on the other end** — the `/vimix/*` command lane stays on OSC; everything between viOSC and its UI is HTTP (ADR-viosc-http-link in the VJmix repo). The old `/viosc/*` lanes still work for one release.
 
 > This project talks the protocol documented in the [Vimix Open Sound Control API](https://github.com/brunoherbelin/vimix/wiki/Open-Sound-Control-API).
 
@@ -161,7 +164,8 @@ accepts a peer only after that peer has presented the code:
 | Setting (config JSON) | Default | Description |
 | :--- | :--- | :--- |
 | `pairing_enabled` | `true` | Require the code on every surface. Set `false` to restore the previous open behaviour. |
-| `pairing_code_length` | `4` | Digits in the code (rotates at every start, never persisted). |
+| `pairing_code_length` | `4` | Digits in the code. |
+| `pairing_code_ttl_hours` | `24` | Lifetime of the pairing code. It is persisted (so an internal restart does not force a re-pairing) and ROTATES when this TTL elapses, at boot or while running. `pairing_code_created_at` is the hidden timestamp that makes that possible. |
 | `pairing_lease_seconds` | `3600` | How long a bound peer stays bound (it re-authenticates after). |
 | `pairing_trusted_peers` | `[]` | IPs that bypass pairing (the escape for third-party OSC controllers). |
 | `pairing_lock_after` | `5` | Consecutive failed attempts before that peer is locked. |
