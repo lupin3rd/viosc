@@ -2,7 +2,7 @@
 
 **viOSC** is an OSC router, state mirror and monitoring layer for [Vimix](https://github.com/brunoherbelin/vimix), the live-mixing VJ software. It runs on the same machine as Vimix, talks to it over localhost using Vimix's **default OSC ports** (no Vimix configuration required), and exposes a small OSC API for an external UI/controller.
 
-It keeps an up-to-date table of Vimix source properties in memory and serves it over HTTP (0.8.0):
+It keeps an up-to-date table of Vimix source properties in memory and serves it over HTTP (0.9.0):
 
 - **Base table** — every source's `name` and `alpha`, refreshed from Vimix's sync bundle, with automatic removal of sources that no longer exist. Since 0.8.0 a **state tier** (`id`, `index`, `name`, `alpha`, `blending`, `correction`, `depth`, `position`, `size`, `angle`, `play`, `lock`, `speed`, `seek`) is polled with **one `get` per source per second**, for every source; a session change (`/vimix/session/open`) triggers an immediate refresh instead of waiting for the tick. The discovery keys `uri`, `type`, `media_kind` and `duration_s` ride the same payload.
 - **Snapshot + delta stream** — `GET /state` (with `rev` and an `ETag`/`304`) for the whole table, `GET /events` (Server-Sent Events) for one ordered delta per change. A revision gap means: refetch the snapshot.
@@ -10,8 +10,19 @@ It keeps an up-to-date table of Vimix source properties in memory and serves it 
 - **Echo** — a forwarded `/vimix/<target>/<prop>` set **without a `ms` duration** is applied to the mirror as it passes through, so the consumer's own writes are never stale.
 - **Thumbnails** — for every media source: the `uri` is fetched once (on discovery) and a random JPEG frame (10%–90% of the video) is generated locally with FFmpeg; `GET /thumb/<name>/<index>`, `POST /thumb/regen`.
 - **Name-based addressing** — commands target sources by **name** (stable across reordering/removal), while indices are only used internally to parse Vimix's replies.
-- **OSC only where Vimix is on the other end** — the `/vimix/*` command lane stays on OSC; everything between viOSC and its UI is HTTP (ADR-viosc-http-link in the VJmix repo). The old `/viosc/*` lanes still work for one release.
+- **OSC only where Vimix is on the other end** — the `/vimix/*` command lane stays on OSC; everything between viOSC and its UI is HTTP (ADR-viosc-http-link in the VJmix repo). The old `/viosc/*` lanes are kept in 0.9.0 for VJmix 1.1.x and removed in 0.10.0.
 
+> **0.9.0 requires Vimix 0.9.3+** (the `id`/`type` OSC attributes and the roster
+> completeness marker). It ships for **Linux** (AppImage/source) and **macOS
+> Apple Silicon** (unsigned `.app` + DMG; see [macOS](#macos)).
+>
+> The deprecated `/viosc/*` OSC lanes are **kept in 0.9.0** for VJmix 1.1.x
+> compatibility and are **removed in 0.10.0**. The HTTP data plane
+> (`/state`, `/events`, `/interest`, `/thumb`, `POST /thumb/regen`) is the
+> supported UI transport. On macOS the legacy UDP output is best-effort: the
+> kernel caps one datagram at `net.inet.udp.maxdgram` (9216 B); viOSC raises
+> `SO_SNDBUF` for the two large lanes and logs a failed send instead of raising.
+>
 > This project talks the protocol documented in the [Vimix Open Sound Control API](https://github.com/brunoherbelin/vimix/wiki/Open-Sound-Control-API).
 
 ---
@@ -21,10 +32,10 @@ It keeps an up-to-date table of Vimix source properties in memory and serves it 
 - Multi-port OSC router with transparent pass-through of standard `/vimix/...` commands
 - In-memory state cache of all sources and their properties
 - Automatic `uri` discovery + random thumbnail generation per media source (concurrency-limited)
-- Per-source property **monitoring** with a 2 s polling loop
-- Ghost-source pruning (sources removed in Vimix disappear from the table)
-- JSON state broadcast to the UI, with the monitor registry included
-- Start-up dependency checks (`python-osc`, `ffmpeg`, `ffprobe`) with clear error messages
+- One coalesced poll per source: a 1 s **state tier** + per-Mapping `/interest` (the monitor/watch lanes stay as compatibility fallbacks)
+- Safe ghost-source pruning: a round must be complete; a large drop is confirmed by an index probe; a lost/truncated bundle never deletes live sources
+- JSON state broadcast to the UI, with the monitor registry included (deprecated in favour of `/state` + `/events`)
+- Start-up dependency checks (`python-osc`, `ffmpeg`, `ffprobe`); a missing ffmpeg disables thumbnails/preview but never stops the router
 - All communication with Vimix happens on localhost with Vimix's default OSC ports (7000 receive / 7001 send) — **zero Vimix configuration**
 
 ---
@@ -55,15 +66,24 @@ viOSC runs two UDP servers and one client:
 
 ## Requirements
 
-- **Python 3.8+**
+- **Vimix 0.9.3+** (OSC `id`/`type`; the 0.9.0 requirement)
+- **Python 3.10+** for the source install (the bundles carry 3.13)
 - [**python-osc**](https://pypi.org/project/python-osc/) — `pip install python-osc`
-- **FFmpeg / FFprobe** — required for thumbnail extraction (e.g. `sudo apt install ffmpeg` on Debian/Ubuntu)
+- **FFmpeg / FFprobe** for thumbnails and preview (bundled in the AppImage and the macOS `.app`; `sudo apt install ffmpeg` / `brew install ffmpeg` for a source install)
 
-At start-up viOSC verifies that `python-osc` is importable and that the `ffmpeg` / `ffprobe` executables are reachable, and exits with a clear error if any is missing.
+At start-up viOSC verifies that `python-osc` is importable and that `ffmpeg` /
+`ffprobe` are reachable. A missing ffmpeg is **not fatal**: the daemon logs a
+clear error, keeps the OSC router and the HTTP state plane running, and
+disables thumbnails/preview. On macOS it probes `PATH`, `/opt/homebrew/bin`,
+`/usr/local/bin`, `/opt/local/bin` and the bundle's `Contents/Resources/bin`.
 
-> **AppImage:** from v0.3.0 a single-file AppImage is available that bundles
-> CPython, python-osc, the tkinter GUI and a **static GPL ffmpeg/ffprobe**, so
-> no Python or ffmpeg install is needed (see [Packaging](#packaging)).
+> **Linux AppImage:** a single-file AppImage bundles CPython, python-osc, the
+> tkinter GUI and a **static GPL ffmpeg/ffprobe**, so no Python or ffmpeg
+> install is needed (see [Packaging](#packaging)).
+>
+> **macOS:** the `.app`/DMG bundles CPython, Tk, python-osc and a pinned static
+> ffmpeg/ffprobe (**arm64** or **x86_64**). It is **unsigned**; see
+> [macOS](#macos) for the first-launch step.
 
 ---
 
@@ -88,6 +108,67 @@ Run it like the source version (GUI by default, `--headless` for the console
 daemon). Note: viOSC is **GPL-3.0**; the static ffmpeg/ffprobe it bundles are
 separate executables under their own GPL license, invoked via subprocess (the
 same boundary as installing ffmpeg with apt today).
+
+### macOS
+
+**No local Mac is required to build.** The `build-macos` GitHub Actions
+workflow (free Intel `macos-14` runner) produces two DMGs:
+
+- **x86_64** — built and smoke-tested **headless** on the runner (`/state` 200,
+  bundled ffmpeg). Runs on Intel Macs and on Apple Silicon through Rosetta 2.
+- **arm64** — cross-built with the python.org **universal2** framework + Tk and
+  the pinned static arm64 ffmpeg. The Intel runner verifies the layout/arch but
+  cannot execute it; a Mac/rig should smoke it before calling it release-grade.
+
+On GitHub: **Actions → build-macos → Run workflow**, then download the
+`viOSC-macos-x86_64` / `viOSC-macos-arm64` artifacts. Or from a shell:
+
+```bash
+git push origin feat/viosc-0.9.0
+gh workflow run build-macos.yml --ref feat/viosc-0.9.0
+gh run watch
+gh run download <run-id> -n viOSC-macos-x86_64 -D dist
+gh run download <run-id> -n viOSC-macos-arm64 -D dist
+```
+
+If you do have a Mac, the same scripts work locally:
+
+```bash
+ARCH=arm64 bash scripts/build_macos_app.sh    # dist/viOSC-<APP_VERSION>-arm64.dmg
+ARCH=x86_64 bash scripts/build_macos_app.sh   # dist/viOSC-<APP_VERSION>-x86_64.dmg
+EXPECTED_ARCH=arm64 bash scripts/verify_macos_app.sh
+```
+
+The **x64** DMG is the guaranteed artifact on the free runner; the **arm64**
+cross-build is best-effort. If it fails on the runner, use a paid arm64 larger
+runner (`macos-14-xlarge`); the workflow takes it as an input:
+
+```bash
+gh workflow run build-macos.yml --ref feat/viosc-0.9.0 \
+  -f arm64_runner=macos-14-xlarge
+```
+
+On that runner the same job installs the universal2 framework, builds arm64,
+and **runs** the headless smoke (`runner.arch == ARM64`).
+
+The DMG is **unsigned** (no Apple Developer ID in this release). On a downloaded
+copy, macOS quarantines it; the first launch needs **right-click → Open**, or:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/viOSC.app
+```
+
+The app binds 6666/7001/8686; allow incoming connections in the macOS firewall
+prompt. The bundled ffmpeg is pinned (`ffmpeg-static` `b6.1.1`, arm64, sha256
+recorded in `scripts/build_macos_app.sh`) and its GPL licence/notice are inside
+`Contents/Resources`.
+
+**Known upstream limit:** Vimix sends the roster in **one** UDP datagram, and
+Darwin caps a datagram at 9216 B unless the sender raises `SO_SNDBUF`. For very
+large sessions (~75+ sources with 20-char names, fewer with long names) that
+send can fail. viOSC 0.9.0 detects the missing round and rebuilds the roster
+with a small per-index probe (`/vimix/<i>/get s name index id`), so the app
+still discovers the session; the limit disappears when Vimix chunks the bundle.
 
 ---
 
@@ -195,7 +276,26 @@ Two things to know about how Vimix replies:
 
 The monitor registry is **keyed by name** on purpose: Vimix re-indexes sources on reorder/removal, while a name only changes when a user renames the source manually.
 
+### Deprecated: `/viosc/*` OSC lanes (removed in 0.10.0)
+
+The lanes in this section are kept in 0.9.0 because VJmix 1.1.x still uses
+`/viosc/regen_thumb` and keeps `/viosc/thumb` + `/viosc/replythumb` and
+`/viosc/replydata` as last-resort fallbacks. Use the HTTP replacements:
+
+| Deprecated OSC lane | Replacement |
+|---|---|
+| `/viosc/replydata` | `GET /state` (snapshot) + `GET /events` (delta stream) |
+| `/viosc/thumb` + `/viosc/replythumb` | `GET /thumb/<name>/<index>` |
+| `/viosc/regen_thumb/<name>` | `POST /thumb/regen` (`{"source": "<name>"}`) |
+| `/viosc/monitor` + `/viosc/watch` | `POST /interest` |
+| `/viosc/sync/<target>` | `POST /interest` (one-shot) |
+| `/viosc/auth` | `POST /auth` (OSC-only clients may keep using it) |
+
 ### Commands — port 6666 (input)
+
+> **Deprecated in 0.9.0.** The commands below still work (VJmix 1.1.x
+> compatibility); the HTTP data plane is the supported path. Removal is
+> planned for 0.10.0.
 
 #### `/viosc/auth <code>`
 

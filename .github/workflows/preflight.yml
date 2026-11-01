@@ -1,0 +1,61 @@
+# Preflight on Linux + macOS (e04s03). The macOS job is the first real proof
+# that the daemon's tests and the Tk import work on the platform we ship.
+name: preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: preflight (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      # Ubuntu's python.org toolcache build needs the Tk shared libraries for
+      # _tkinter; macOS ships them with the framework build.
+      - name: Tk libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk tk
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Runtime smoke
+        run: |
+          python -VV
+          python -c "import tkinter, pythonosc; print('Tk', tkinter.TkVersion)"
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Format
+        run: python -m ruff format --check .
+
+      - name: Typecheck
+        run: python -m mypy
+
+      - name: Tests
+        run: python -m pytest tests/ -q

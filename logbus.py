@@ -12,9 +12,19 @@ and test capture behave exactly like a plain print.
 Headless by construction: no tkinter, no OSC, no daemon import.
 """
 
+import re
+import sys
 import threading
 from collections import deque
 from collections.abc import Callable
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(text: str) -> str:
+    """The plain text of a daemon log line (the console keeps the colours)."""
+    return _ANSI_RE.sub("", str(text))
+
 
 Listener = Callable[[str, str], None]
 
@@ -72,8 +82,11 @@ def console_listener(text: str, level: str = "info") -> None:
     """Default listener: print the line exactly as the legacy daemon did.
 
     ``level`` is ignored here (the GUI tinting story reads it instead); the
-    ANSI colors live in ``text`` and pass through unchanged.
+    ANSI colors live in ``text`` and pass through unchanged. A PyInstaller
+    ``--windowed`` app has no stdout; the daemon must keep running there.
     """
+    if sys.stdout is None:
+        return
     print(text)
 
 

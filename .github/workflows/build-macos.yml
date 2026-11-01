@@ -1,0 +1,151 @@
+# Build the macOS .app/DMG without a local Mac (e04s02/e04s03).
+#
+# The standard macOS runner is Intel (x64). The x64 job builds and *runs* the
+# headless smoke, so the macOS runtime path is exercised. The arm64 job
+# cross-builds with the python.org universal2 framework (Tk is universal2) and
+# verifies the layout/arch; an Intel runner cannot execute an arm64 app, so the
+# arm64 runtime is not launched here. If the cross-build is not enough, use a
+# paid arm64 larger runner (`macos-14-xlarge`) with the same two commands.
+name: build-macos
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm64_runner:
+        description: >-
+          Runner for the arm64 job: macos-14 (free Intel cross-build) or
+          macos-14-xlarge (paid native arm64 larger runner).
+        required: false
+        default: macos-14
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-appimage:
+    name: Linux AppImage build + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install AppImage tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file
+      - name: Build
+        run: |
+          set +e
+          bash scripts/build_appimage.sh > build-appimage.log 2>&1
+          rc=$?
+          tail -60 build-appimage.log
+          if [ $rc -ne 0 ]; then
+            msg="$(tr '\r' '\n' < build-appimage.log \
+              | grep -iE 'error|failed|missing|cannot|no such|sha256|not found|curl:' \
+              | tail -6 | tr '\n' ' ' | cut -c1-1200)"
+            [ -n "$msg" ] || msg="$(tail -5 build-appimage.log | tr '\n' ' ' | cut -c1-1200)"
+            echo "::error title=Linux AppImage build failed::$msg"
+            {
+              echo "### Linux AppImage build failed"
+              echo '```'
+              tail -120 build-appimage.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit $rc
+          fi
+      - name: Verify
+        run: bash scripts/verify_appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viOSC-linux-appimage
+          path: dist/viosc-*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-x64:
+    name: macOS x86_64 build + headless smoke
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build
+        env:
+          ARCH: x86_64
+        run: bash scripts/build_macos_app.sh
+      - name: Verify (runtime)
+        env:
+          EXPECTED_ARCH: x86_64
+        run: bash scripts/verify_macos_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viOSC-macos-x86_64
+          path: dist/viOSC-*-x86_64.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  macos-arm64-cross:
+    name: macOS arm64 build (python.org universal2)
+    runs-on: ${{ inputs.arm64_runner || 'macos-14' }}
+    steps:
+      - name: Runner architecture
+        run: |
+          echo "runner.arch=${{ runner.arch }}"
+      - uses: actions/checkout@v4
+      - name: Install the python.org universal2 framework
+        run: |
+          set -euo pipefail
+          # 3.13.17 is the latest 3.13 with a published macos11 universal2 pkg.
+          VERSION="3.13.17"
+          echo "python.org 3.13: $VERSION"
+          curl -fL -o python.pkg \
+            "https://www.python.org/ftp/python/${VERSION}/python-${VERSION}-macos11.pkg"
+          sudo installer -pkg python.pkg -target /
+          PY="/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
+          "$PY" -VV
+          lipo -info "$PY"
+          lipo -info "$PY" | grep -q arm64
+          lipo -info "$PY" | grep -q x86_64
+      - name: Build
+        env:
+          ARCH: arm64
+          MACOS_PYTHON: /Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13
+          MACOS_VENV: .venv-macos-arm64
+        run: bash scripts/build_macos_app.sh
+      - name: Verify layout/arch (runtime only on a native arm64 runner)
+        env:
+          EXPECTED_ARCH: arm64
+          SKIP_RUNTIME: ${{ runner.arch == 'ARM64' && '0' || '1' }}
+        run: bash scripts/verify_macos_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viOSC-macos-arm64
+          path: dist/viOSC-*-arm64.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish the GitHub release
+    needs: [linux-appimage, macos-x64, macos-arm64-cross]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: viOSC-*
+          path: artifacts
+          merge-multiple: true
+      - name: List the release assets
+        run: ls -lh artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: viOSC 0.9.0
+          body_path: RELEASE_NOTES_0.9.0.md
+          files: artifacts/*
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

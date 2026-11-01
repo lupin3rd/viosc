@@ -1,0 +1,29 @@
+# Tooling configuration (ruff / mypy / pytest) — mechanical gates (G6).
+# Runtime dependencies stay in requirements.txt (python-osc only). The app
+# version lives in viosc.py (APP_VERSION) — single source, read by the
+# AppImage build script.
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+exclude = [".venv"]
+
+[tool.ruff.lint]
+# Same curated set as VJmix: E/F = pycodestyle+pyflakes, I = isort,
+# UP = pyupgrade, B = bugbear, SIM = flake8-simplify, C4 = comprehensions,
+# RUF = ruff-specific.
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# Daemon worker-thread defensive posture (AGENTS.md § Defensive Code):
+# threads must never die — a blind `except Exception` is the intended posture
+# for OSC handlers, thumbnails, monitor poll and the preview bind (BLE001).
+"viosc.py" = ["BLE001"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
+files = ["viosc.py", "viosc_gui.py", "preview_http.py", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
