@@ -30,11 +30,13 @@ from typing import Any
 
 import config
 from logbus import bus as log_bus
+from logbus import strip_ansi
 
 LOG_PUMP_MS = 50
 STATUS_POLL_MS = 1000
 CONFIG_POLL_MS = 2000
 LOG_QUEUE_MAX = 500
+GUI_LOG_MAX_LINES = 2000
 FORM_COLUMNS = 2
 TIMESTAMP_FMT = "%H:%M:%S"
 FILTER_ALL = "All"
@@ -211,8 +213,10 @@ class VioscWindow:
         return self.log_filter == FILTER_ALL or level == "error"
 
     def _append_log(self, text: str, level: str) -> None:
-        line = self._render_line(text)
+        line = self._render_line(strip_ansi(text))
         self.log_lines.append((level, line))
+        if len(self.log_lines) > GUI_LOG_MAX_LINES:
+            del self.log_lines[: len(self.log_lines) - GUI_LOG_MAX_LINES]
         if self._visible(level):
             self._insert_line(line, level)
 

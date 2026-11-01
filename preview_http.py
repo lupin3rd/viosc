@@ -93,9 +93,18 @@ def clean_media_path(uri_value):
     return os.path.abspath(unquote(uri_str))
 
 
-def resolve_media_path(name, vimix_data):
-    """Absolute media path for a source name in ``vimix_data``, or None."""
-    for data in vimix_data.values():
+def resolve_media_path(name, vimix_data, lock=None):
+    """Absolute media path for a source name in ``vimix_data``, or None.
+
+    The daemon passes its mirror lock so a concurrent OSC ingest cannot mutate
+    the dict while it is being iterated (e03s02).
+    """
+    if lock is None:
+        sources = list(vimix_data.values())
+    else:
+        with lock:
+            sources = list(vimix_data.values())
+    for data in sources:
         if data.get("name") == str(name):
             uri = data.get("uri")
             if not uri:
@@ -120,6 +129,7 @@ def make_preview_handler(
     apply_interest=None,
     regen_thumb=None,
     apply_lane=None,
+    state_lock=None,
 ):
     """Build a handler class bound to the daemon's live state table and probe.
 
@@ -254,7 +264,7 @@ def make_preview_handler(
             if action not in ("file", "meta"):
                 self.send_error(404)
                 return
-            path = resolve_media_path(name, vimix_data)
+            path = resolve_media_path(name, vimix_data, state_lock)
             if path is None:
                 self.send_error(404)
                 return
@@ -682,6 +692,7 @@ def start_preview_server(
     apply_interest=None,
     regen_thumb=None,
     apply_lane=None,
+    state_lock=None,
 ):
     """Bind (and return) the preview HTTP server against the daemon's state."""
     handler = make_preview_handler(
@@ -699,6 +710,7 @@ def start_preview_server(
         apply_interest=apply_interest,
         regen_thumb=regen_thumb,
         apply_lane=apply_lane,
+        state_lock=state_lock,
     )
 
     class PreviewServer(socketserver.ThreadingTCPServer):

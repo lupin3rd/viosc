@@ -28,10 +28,10 @@ import fs_api
 import mix_schema
 import pairing
 from logbus import bus as log_bus
-from logbus import console_listener
+from logbus import console_listener, strip_ansi
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.8.0"
+APP_VERSION: str = "0.9.0"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666
@@ -44,15 +44,29 @@ FROMVIMIX_PORT = 7001
 # replies. 256 KiB is the named, reviewable value; the kernel caps it at
 # net.core.rmem_max and contextlib.suppress keeps a refusing platform harmless.
 RECV_BUFFER_BYTES = 262144
+# e03s01: the roster bundle is ONE datagram. socketserver defaults to 8192 B,
+# which truncates a 100-source bundle (~12 KB) before python-osc parses it.
+# Read up to the maximum UDP payload so the daemon never cuts a Vimix bundle.
+MAX_OSC_DATAGRAM_BYTES = 65535
+# e03s03: Vimix unique ids are large (up to 10^18); source indices are small.
+# A numeric target above this that matches no known id is an id, never an index.
+MAX_SOURCE_INDEX = 4096
 
 UI_IP = os.environ.get("VIOSC_UI_IP", "127.0.0.1")
 REPLY_PORT = 6667
+# e03s04: macOS caps one UDP datagram at net.inet.udp.maxdgram (9216) unless
+# the sender raises SO_SNDBUF; 65507 is the IPv4 maximum.
+MAX_LEGACY_UDP_PAYLOAD = 65507
 
 TOVIMIX_IP = "127.0.0.1"
 TOVIMIX_PORT = 7000
 
 FFMPEG_PATH = os.environ.get("VIOSC_FFMPEG", "ffmpeg")
 FFPROBE_PATH = os.environ.get("VIOSC_FFPROBE", "ffprobe")
+# e04s01: a missing ffmpeg disables thumbnails/preview, never the OSC router.
+FFMPEG_AVAILABLE = True
+# Finder-launched macOS apps get a minimal PATH; probe the usual package dirs.
+DARWIN_BINARY_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin")
 
 LOG_LEVEL = 1
 
@@ -101,6 +115,30 @@ LANE_TTL_S = 30.0
 # has forwarded one, and once more 500 ms later because vimix loads the media
 # asynchronously. The forward itself is untouched.
 SESSION_SYNC_RETRY_MS = 500
+# e03s02 (user decision D5): every /vimix/current/sync send goes through this
+# gap. A skipped session immediate is replaced by its +500 ms retry, so the
+# first post-session roster is never later than 500 ms and the routine burst is
+# two sends instead of three. The core 2 s sync is skipped/reset the same way.
+SYNC_MIN_GAP_S = 0.5
+# e03s01: if a requested round produces no current/0 within this window, probe.
+# 600 ms leaves the session retry (500 ms) a chance to deliver first.
+SYNC_ROUND_TIMEOUT_S = 0.6
+# The index probe used only when a round is lost/incomplete (macOS maxdgram,
+# UDP loss, an oscpack overflow). Replies are per-index and small.
+DISCOVERY_PROBE_MAX = 128
+DISCOVERY_PROBE_TIMEOUT_S = 1.0
+DISCOVERY_PROBE_MIN_INTERVAL_S = 5.0
+# Prune policy: a round is complete when current/<i> and <i>/id agree; a big
+# drop is confirmed by the probe before pruning. A source missing for K rounds
+# also asks for a probe (never a blind prune).
+PRUNE_MAX_MISSED_ROUNDS = 3
+ROSTER_DROP_CONFIRM = 4
+ROSTER_DROP_RATIO = 0.20
+# Thumbnails only for the file-backed video/image types; 13 audio, 25 image
+# sequence, 27 text, etc. are "other" (e03s03).
+THUMBNAIL_TYPE_CODES = frozenset({10, 12})
+# e03s03: one warning when Vimix answers sources but no id/type (pre-0.9.3).
+VIMIX_COMPAT_TIMEOUT_S = 5.0
 # The session mutations that change the roster and emit no bundle of their own.
 SESSION_COMMAND_ADDRESSES = ("vimix/session/open", "vimix/session/version")
 
@@ -177,8 +215,21 @@ COLOR_THUMB = "\033[96m"
 COLOR_RESET_EV = "\033[91m"
 COLOR_TIMESTAMP = "\033[90m"
 
+
+def _tune_ui_client(client: Any) -> None:
+    """Raise the legacy UDP send limit on Darwin (e03s04, best effort)."""
+    if sys.platform != "darwin":
+        return
+    sock = getattr(client, "_sock", None)
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_LEGACY_UDP_PAYLOAD)
+
+
 forward_client = SimpleUDPClient(TOVIMIX_IP, TOVIMIX_PORT)
 ui_reply_client = SimpleUDPClient(UI_IP, REPLY_PORT)
+_tune_ui_client(ui_reply_client)
 
 vimix_data: dict[int, dict[str, Any]] = {}
 source_current: int | None = None
@@ -229,6 +280,28 @@ _state_tier_last = 0.0
 _last_core_sync = 0.0
 _last_monitor_poll = 0.0
 _pending_session_sync_at = 0.0
+# e03s01: roster-round tracking. `seen_current` is filled by current/<i>;
+# `seen_id` by the index-addressed <i>/id that Vimix 0.9.3 puts in the same
+# bundle. They are equal on a complete round. A cut exactly on a source
+# boundary can still look complete, so a big drop is confirmed by the probe.
+seen_current: set[int] = set()
+seen_id: set[int] = set()
+_roster_missed: dict[int, int] = {}
+_awaiting_roster = False
+_sync_sent_at = 0.0
+_last_sync_sent = 0.0
+_probe_active = False
+_probe_started_at = 0.0
+_probe_last_at = 0.0
+_probe_requested: set[int] = set()
+_probe_found: dict[int, str] = {}
+_vimix_compat_warned = False
+vimix_has_093 = False
+_first_source_at = 0.0
+# e03s02: one lock for the mirror and the registries that serialize it.
+STATE_LOCK = threading.RLock()
+# e03s04: rate-limit the macOS legacy-UDP error line.
+_legacy_udp_error_at = 0.0
 monitor_misses: dict[str, int] = {}
 MONITOR_MAX_MISSES = 3
 # e40s05: TARGETED WATCH LANE — a client asks for a few properties of one source
@@ -261,6 +334,7 @@ def _create_clients() -> None:
     global forward_client, ui_reply_client
     forward_client = SimpleUDPClient(TOVIMIX_IP, TOVIMIX_PORT)
     ui_reply_client = SimpleUDPClient(UI_IP, REPLY_PORT)
+    _tune_ui_client(ui_reply_client)
     watch_clients.clear()  # e40s05: the watch replies follow REPLY_PORT
 
 
@@ -467,10 +541,44 @@ def create_empty_vimix_entry():
 
 
 def find_index_by_name(name_str):
-    for idx, data in vimix_data.items():
-        if data.get("name") == name_str:
-            return idx
+    with STATE_LOCK:
+        for idx, data in vimix_data.items():
+            if data.get("name") == name_str:
+                return idx
     return None
+
+
+def find_index_by_id(source_id: int) -> int | None:
+    """The mirror index of a Vimix unique id (0.9.3 id targeting, e03s03)."""
+    with STATE_LOCK:
+        for idx, data in vimix_data.items():
+            if data.get("id") == source_id:
+                return idx
+    return None
+
+
+def _resolve_target_index(target_str: str) -> int | None:
+    """Resolve a numeric target to an index or unique id, never a phantom.
+
+    Vimix 0.9.3 accepts /vimix/<index> and /vimix/<unique-id>; it answers a
+    get with the SAME target string. An existing index (or one announced by a
+    current/<i> in this round, or requested by the index probe) wins, then a
+    known unique id, then a name. A numeric target that matches none is dropped
+    instead of creating a phantom entry.
+    """
+    if target_str.isdigit():
+        number = int(target_str)
+        if number in vimix_data or number in seen_indices:
+            return number
+        if _probe_active and number in _probe_requested:
+            return number
+        by_id = find_index_by_id(number)
+        if by_id is not None:
+            return by_id
+        # A bare index that has not been announced yet is still a valid Vimix
+        # target (a get reply can precede the roster); a huge number is an id.
+        return number if number <= MAX_SOURCE_INDEX else None
+    return find_index_by_name(target_str)
 
 
 def clean_uri_path(uri_value):
@@ -486,6 +594,8 @@ def clean_uri_path(uri_value):
 
 
 def get_video_duration(file_path):
+    if not FFMPEG_AVAILABLE:
+        return 0.0
     cmd = [
         FFPROBE_PATH,
         "-v",
@@ -516,6 +626,8 @@ def get_video_duration(file_path):
 
 
 def extract_single_frame(file_path, timestamp_sec, width=320, height=180):
+    if not FFMPEG_AVAILABLE:
+        return None
     cmd = [
         FFMPEG_PATH,
         "-y",
@@ -600,6 +712,8 @@ def probe_media_meta(file_path):
     media moves (duration > 0.25 s or several frames), "image" for a still
     decoded as a single video frame.
     """
+    if not FFMPEG_AVAILABLE:
+        return None
     if file_path in MEDIA_META_CACHE:
         return MEDIA_META_CACHE[file_path]
     meta = None
@@ -659,11 +773,33 @@ def classify_media_kind(file_path) -> str:
     drops the cached None and probes once more; a second None means "other" —
     no thumbnail can be produced, and VJmix is told so.
     """
+    if not FFMPEG_AVAILABLE:
+        return MEDIA_KIND_OTHER
     meta = probe_media_meta(file_path)
     if meta is None:
         MEDIA_META_CACHE.pop(file_path, None)
         meta = probe_media_meta(file_path)
     return meta["kind"] if meta else MEDIA_KIND_OTHER
+
+
+def _source_type_is_thumbnailable(idx: int) -> bool:
+    """False when Vimix already told us the type is not a video/image file."""
+    with STATE_LOCK:
+        source_type = vimix_data.get(idx, {}).get("type")
+    if isinstance(source_type, bool) or not isinstance(source_type, int):
+        return True  # type not known yet: let ffprobe decide
+    return source_type in THUMBNAIL_TYPE_CODES
+
+
+def _mark_media_kind_other(idx: int, reason: str) -> None:
+    with STATE_LOCK:
+        if vimix_data.get(idx, {}).get("media_kind") == MEDIA_KIND_OTHER:
+            return
+        vimix_data[idx]["media_kind"] = MEDIA_KIND_OTHER
+        record_change(idx, "media_kind", MEDIA_KIND_OTHER)
+    schedule_state_broadcast()
+    if LOG_LEVEL >= 1:
+        log_bus.emit(f"{COLOR_THUMB}[THUMB SKIP]{COLOR_RESET} Index {idx}: {reason}; no thumbnails")
 
 
 def publish_media_kind(idx, uri_value):
@@ -675,31 +811,51 @@ def publish_media_kind(idx, uri_value):
     """
     if idx not in vimix_data or not uri_value:
         return None
+    if not _source_type_is_thumbnailable(idx):
+        _mark_media_kind_other(idx, "source type is not a video/image file")
+        return MEDIA_KIND_OTHER
     file_path = clean_uri_path(uri_value)
     if not os.path.exists(file_path):
         return None
     kind = classify_media_kind(file_path)
     changed = False
-    if vimix_data[idx].get("media_kind") != kind:
-        vimix_data[idx]["media_kind"] = kind
-        record_change(idx, "media_kind", kind)
-        changed = True
+    with STATE_LOCK:
+        if vimix_data[idx].get("media_kind") != kind:
+            vimix_data[idx]["media_kind"] = kind
+            record_change(idx, "media_kind", kind)
+            changed = True
     # e83: the clip LENGTH, from the same cached probe. `seek` is a fraction of the
     # timeline, so the app's seek bar needs the duration to dead-reckon (a fraction
     # advanced by `speed` alone saturates to 100% in one second). A viOSC-local key
     # like media_kind: not an OSC property, no contract change.
     meta = probe_media_meta(file_path)
     duration = float(meta.get("duration_s") or 0.0) if meta else 0.0
-    if duration > 0.0 and abs(float(vimix_data[idx].get("duration_s") or 0.0) - duration) > 0.001:
-        vimix_data[idx]["duration_s"] = duration
-        record_change(idx, "duration_s", duration)
-        changed = True
+    with STATE_LOCK:
+        if (
+            duration > 0.0
+            and abs(float(vimix_data[idx].get("duration_s") or 0.0) - duration) > 0.001
+        ):
+            vimix_data[idx]["duration_s"] = duration
+            record_change(idx, "duration_s", duration)
+            changed = True
     if changed:
         schedule_state_broadcast()
     return kind
 
 
 def generate_thumbnails_worker(idx, uri_value):
+    if not FFMPEG_AVAILABLE:
+        if LOG_LEVEL >= 1:
+            log_bus.emit(
+                f"{COLOR_THUMB}[THUMB SKIP]{COLOR_RESET} ffmpeg is not available; "
+                "thumbnails are disabled"
+            )
+        return
+    if not _source_type_is_thumbnailable(idx):
+        _mark_media_kind_other(idx, "source type is not a video/image file")
+        return
+    if not isinstance(uri_value, str):
+        return
     file_path = clean_uri_path(uri_value)
     if not os.path.exists(file_path):
         log_bus.emit(
@@ -723,9 +879,12 @@ def generate_thumbnails_worker(idx, uri_value):
     count = THUMB_MAX_COUNT if kind == "video" else 1
     with thumb_semaphore:
         thumbnails = extract_thumbnails_from_file(file_path, count=count)
-    if idx in vimix_data:
-        if thumbnails:
+    with STATE_LOCK:
+        present = idx in vimix_data
+        if present and thumbnails:
             vimix_data[idx]["thumbnails"] = thumbnails
+    if present:
+        if thumbnails:
             if LOG_LEVEL >= 1:
                 log_bus.emit(
                     f"{COLOR_THUMB}[THUMB READY]{COLOR_RESET} Index {idx}: generated "
@@ -852,21 +1011,22 @@ def record_change(idx, prop, value, kind="changed") -> int:
     The source is the NAME (what VJmix addresses), falling back to the index.
     """
     global state_rev
-    state_rev += 1
-    source = vimix_data.get(idx, {}).get("name")
-    change_log.append(
-        {
+    with STATE_LOCK:
+        state_rev += 1
+        source = vimix_data.get(idx, {}).get("name")
+        event = {
             "rev": state_rev,
             "kind": kind,
             "source": str(source) if source else str(idx),
             "prop": str(prop),
             "value": value,
         }
-    )
-    hub = EVENT_HUB
-    if hub is not None:
-        hub.publish(change_log[-1])
-    return state_rev
+        change_log.append(event)
+        hub = EVENT_HUB
+        if hub is not None:
+            # Publish under the same lock: the SSE order must equal the rev order.
+            hub.publish(event)
+    return int(event["rev"])
 
 
 def state_payload() -> dict[str, Any]:
@@ -877,21 +1037,39 @@ def state_payload() -> dict[str, Any]:
     Thumbnails are excluded: they are resources of their own (e41s03), and
     inlining the JPEG bytes would put megabytes in every state message.
     """
-    safe_data = {
-        idx: {k: v for k, v in data.items() if k != "thumbnails"}
-        for idx, data in vimix_data.items()
-    }
+    with STATE_LOCK:
+        safe_data = {
+            idx: {k: v for k, v in data.items() if k != "thumbnails"}
+            for idx, data in list(vimix_data.items())
+        }
+        revision = state_rev
+        current = source_current
+        monitored = dict(monitored_sources)
     return {
-        "rev": state_rev,
-        "current_source": source_current,
+        "rev": revision,
+        "current_source": current,
         "sources": safe_data,
-        "monitored": dict(monitored_sources),
+        "monitored": monitored,
     }
 
 
 def state_json() -> str:
     """The state table as the exact JSON text both transports send (e41s04)."""
     return json.dumps(state_payload())
+
+
+def _log_legacy_udp_error(error: BaseException) -> None:
+    """One rate-limited line for a legacy UDP send failure (e03s04)."""
+    global _legacy_udp_error_at
+    now = time.monotonic()
+    if now - _legacy_udp_error_at < 10.0:
+        return
+    _legacy_udp_error_at = now
+    log_bus.emit(
+        f"{COLOR_RESET_EV}[LEGACY UDP]{COLOR_RESET} send failed ({error}); "
+        "the HTTP data plane is the supported path",
+        "error",
+    )
 
 
 def broadcast_vimix_state():
@@ -901,6 +1079,8 @@ def broadcast_vimix_state():
         return  # e82s03: a consumer reading over HTTP is not pushed to
     try:
         ui_reply_client.send_message("/viosc/replydata", [state_json()])
+    except OSError as e:
+        _log_legacy_udp_error(e)
     except Exception as e:
         log_bus.emit(f"Broadcast error: {e}", "error")
 
@@ -919,7 +1099,7 @@ def schedule_state_broadcast(now: float | None = None) -> bool:
     delivers it. Returns True when a message went out now.
     """
     global _last_state_broadcast_at, _state_broadcast_pending
-    clock = time.time() if now is None else now
+    clock = time.monotonic() if now is None else now
     if clock - _last_state_broadcast_at >= STATE_BROADCAST_WINDOW_MS / 1000.0:
         _last_state_broadcast_at = clock
         _state_broadcast_pending = False
@@ -938,7 +1118,7 @@ def flush_state_broadcast(now: float | None = None) -> bool:
     global _last_state_broadcast_at, _state_broadcast_pending
     if not _state_broadcast_pending:
         return False
-    clock = time.time() if now is None else now
+    clock = time.monotonic() if now is None else now
     if clock - _last_state_broadcast_at < STATE_BROADCAST_WINDOW_MS / 1000.0:
         return False
     _last_state_broadcast_at = clock
@@ -948,9 +1128,12 @@ def flush_state_broadcast(now: float | None = None) -> bool:
 
 
 def start_new_sync_round():
-    global sync_round, prune_timer
+    global sync_round, prune_timer, _awaiting_roster
     sync_round += 1
     seen_indices.clear()
+    seen_current.clear()
+    seen_id.clear()
+    _awaiting_roster = False
     if prune_timer:
         prune_timer.cancel()
     prune_timer = threading.Timer(PRUNE_DELAY_SEC, prune_stale_sources, args=(sync_round,))
@@ -958,21 +1141,166 @@ def start_new_sync_round():
     prune_timer.start()
 
 
+def _round_is_complete() -> bool:
+    """True when the roster round is safe to prune (e03s01).
+
+    A 0.9.3 bundle sends both current/<i> and <i>/id for every source. A cut
+    exactly on a source boundary can still make the two sets equal, so a large
+    drop is additionally confirmed by the probe in prune_stale_sources().
+    A missing id set is never treated as complete (the probe is the fallback).
+    """
+    if not seen_current:
+        return False
+    if not seen_id:
+        # Vimix 0.9.3 always sends <i>/id in the same bundle. An empty id set
+        # means a truncated/lost bundle (or a pre-0.9.3 Vimix); never prune on
+        # it. The index probe is the safe confirmation path in both cases.
+        return False
+    return seen_current == seen_id
+
+
+def _delete_source(idx: int) -> None:
+    """Remove one source and journal the removal (caller holds STATE_LOCK)."""
+    record_change(idx, "source", False, kind="removed")
+    del vimix_data[idx]
+    known_indices.discard(idx)
+    _roster_missed.pop(idx, None)
+    if LOG_LEVEL >= 1:
+        log_bus.emit(f"{COLOR_TIMESTAMP}[PRUNE]{COLOR_RESET} Source removed: index {idx}")
+
+
+def _note_missed_roster() -> bool:
+    """Count the sources missing from an incomplete round; True at K misses."""
+    trigger = False
+    for idx in list(vimix_data):
+        if idx in seen_current:
+            _roster_missed.pop(idx, None)
+            continue
+        misses = _roster_missed.get(idx, 0) + 1
+        _roster_missed[idx] = misses
+        if misses >= PRUNE_MAX_MISSED_ROUNDS:
+            trigger = True
+    return trigger
+
+
+def start_roster_probe(now: float | None = None) -> bool:
+    """Ask every index for its identity (e03s01 discovery fallback).
+
+    Used only when a round is lost or incomplete (macOS maxdgram, UDP loss, an
+    oscpack overflow, a cut that looks complete). The replies are small
+    per-index messages, so they are never subject to the one-datagram limit.
+    """
+    global _probe_active, _probe_started_at, _probe_last_at, _probe_requested, _probe_found
+    clock = time.monotonic() if now is None else now
+    with STATE_LOCK:
+        if _probe_active:
+            return False
+        if _probe_last_at and clock - _probe_last_at < DISCOVERY_PROBE_MIN_INTERVAL_S:
+            return False
+        _probe_active = True
+        _probe_started_at = clock
+        _probe_last_at = clock
+        _probe_found = {}
+        _probe_requested = set(range(DISCOVERY_PROBE_MAX))
+    sent = 0
+    for idx in range(DISCOVERY_PROBE_MAX):
+        with contextlib.suppress(Exception):
+            forward_client.send_message(f"/vimix/{idx}/get", ["name", "index", "id"])
+            sent += 1
+    if LOG_LEVEL >= 1:
+        log_bus.emit(
+            f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} round incomplete/lost: probing {sent} indices"
+        )
+    return True
+
+
+def probe_poll(now: float | None = None) -> int:
+    """Finalize a due roster probe and prune to its result (e03s01)."""
+    global _probe_active, source_current
+    clock = time.monotonic() if now is None else now
+    with STATE_LOCK:
+        if not _probe_active:
+            return 0
+        if clock - _probe_started_at < DISCOVERY_PROBE_TIMEOUT_S:
+            return 0
+        _probe_active = False
+        found = {idx: name for idx, name in _probe_found.items() if idx in vimix_data and name}
+        if not found:
+            if LOG_LEVEL >= 1:
+                log_bus.emit(
+                    f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} probe found no source; "
+                    "keeping the current table"
+                )
+            return 0
+        if max(found) >= DISCOVERY_PROBE_MAX - 1:
+            log_bus.emit(
+                f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} probe range may be too small; not pruning",
+                "error",
+            )
+            return 0
+        for idx in list(vimix_data):
+            # The probe only covers 0..DISCOVERY_PROBE_MAX-1; never delete a
+            # source above that range because the probe could not see it.
+            if idx >= DISCOVERY_PROBE_MAX:
+                continue
+            if idx not in found:
+                _delete_source(idx)
+        if not vimix_data:
+            source_current = None
+    if LOG_LEVEL >= 1:
+        log_bus.emit(
+            f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} probe confirmed {len(found)} source(s)"
+        )
+    schedule_state_broadcast()
+    return len(found)
+
+
 def prune_stale_sources(round_id):
+    """Prune only a complete round; a big drop is confirmed by the probe."""
     global source_current
-    if round_id != sync_round:
-        return
-    stale = [idx for idx in list(vimix_data.keys()) if idx not in seen_indices]
-    if not stale:
-        return
-    for idx in stale:
-        record_change(idx, "source", False, kind="removed")
-        del vimix_data[idx]
-        known_indices.discard(idx)
+    need_probe = False
+    reason = ""
+    missing = False
+    current_count = 0
+    id_count = 0
+    drop = 0
+    total = 0
+    with STATE_LOCK:
+        if round_id != sync_round:
+            return
+        current_count = len(seen_current)
+        id_count = len(seen_id)
+        if not _round_is_complete():
+            missing = _note_missed_roster()
+            need_probe = True
+            reason = "incomplete"
+        else:
+            stale = [idx for idx in list(vimix_data.keys()) if idx not in seen_current]
+            if not stale:
+                for idx in list(_roster_missed):
+                    if idx in seen_current:
+                        _roster_missed.pop(idx, None)
+                return
+            drop = len(stale)
+            total = max(1, len(vimix_data))
+            if drop > ROSTER_DROP_CONFIRM and drop / total > ROSTER_DROP_RATIO:
+                _note_missed_roster()
+                need_probe = True
+                reason = "large-drop"
+            else:
+                for idx in stale:
+                    _delete_source(idx)
+                if not vimix_data:
+                    source_current = None
+    if need_probe:
+        start_roster_probe()
         if LOG_LEVEL >= 1:
-            log_bus.emit(f"{COLOR_TIMESTAMP}[PRUNE]{COLOR_RESET} Source removed: index {idx}")
-    if not vimix_data:
-        source_current = None
+            log_bus.emit(
+                f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} {reason} round "
+                f"(current={current_count}, id={id_count}, missing_k={missing}, "
+                f"drop={drop}/{total}): no prune, probing"
+            )
+        return
     schedule_state_broadcast()
 
 
@@ -1043,7 +1371,10 @@ def send_thumbnail_blob(target_identifier, thumb_arg):
     for t_idx in indices_to_send:
         blob_data = thumbnails[t_idx]
         osc_reply_path = f"/viosc/replythumb/{target_identifier}/{t_idx}"
-        ui_reply_client.send_message(osc_reply_path, blob_data)
+        try:
+            ui_reply_client.send_message(osc_reply_path, blob_data)
+        except OSError as e:
+            _log_legacy_udp_error(e)
 
 
 def request_source_props(target_str, props):
@@ -1115,15 +1446,17 @@ def process_monitor_command(target_identifier, args):
 
 
 def monitor_poll():
-    for name in list(monitored_sources.keys()):
-        props = monitored_sources.get(name)
-        if props is None:
-            continue
+    with STATE_LOCK:
+        entries = list(monitored_sources.items())
+    for name, props in entries:
         if find_index_by_name(name) is None:
-            monitor_misses[name] = monitor_misses.get(name, 0) + 1
-            if monitor_misses[name] >= MONITOR_MAX_MISSES:
-                del monitored_sources[name]
-                del monitor_misses[name]
+            with STATE_LOCK:
+                monitor_misses[name] = monitor_misses.get(name, 0) + 1
+                missed = monitor_misses[name] >= MONITOR_MAX_MISSES
+                if missed:
+                    del monitored_sources[name]
+                    del monitor_misses[name]
+            if missed:
                 if LOG_LEVEL >= 1:
                     log_bus.emit(
                         f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} removed: '{name}' "
@@ -1131,7 +1464,8 @@ def monitor_poll():
                     )
                 schedule_state_broadcast()
             continue
-        monitor_misses[name] = 0
+        with STATE_LOCK:
+            monitor_misses[name] = 0
         request_source_props(name, props)
 
 
@@ -1164,7 +1498,8 @@ def process_watch_command(client_address, target_identifier, args) -> bool:
     tokens = [str(a) for a in args if str(a).strip()]
     if not tokens:
         if key in watched_sources:
-            del watched_sources[key]
+            with STATE_LOCK:
+                del watched_sources[key]
             if LOG_LEVEL >= 1:
                 log_bus.emit(f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} stopped: '{name}' from {ip}")
             return True
@@ -1177,17 +1512,20 @@ def process_watch_command(client_address, target_identifier, args) -> bool:
             f"need <cadence_ms {WATCH_MIN_INTERVAL_MS}..{WATCH_MAX_INTERVAL_MS}> <prop...>"
         )
         return False
-    if key not in watched_sources and len(watched_sources) >= WATCH_MAX_ENTRIES:
+    with STATE_LOCK:
+        at_capacity = key not in watched_sources and len(watched_sources) >= WATCH_MAX_ENTRIES
+    if at_capacity:
         log_bus.emit(
             f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} ignored '{name}' from {ip}: "
             f"at capacity ({WATCH_MAX_ENTRIES})"
         )
         return False
-    watched_sources[key] = {
-        "props": props,
-        "interval_ms": interval,
-        "last_poll": time.time(),
-    }
+    with STATE_LOCK:
+        watched_sources[key] = {
+            "props": props,
+            "interval_ms": interval,
+            "last_poll": time.monotonic(),
+        }
     if LOG_LEVEL >= 1:
         log_bus.emit(
             f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} watching '{name}' from {ip} "
@@ -1198,8 +1536,13 @@ def process_watch_command(client_address, target_identifier, args) -> bool:
 
 
 def poll_due(last, interval_ms, now) -> bool:
-    """True when a poll whose last run was ``last`` is due at ``now`` (e82s02)."""
-    return float(now) - float(last) >= max(0, int(interval_ms)) / 1000.0
+    """True when a poll whose last run was ``last`` is due at ``now`` (e82s02).
+
+    The 1e-6 tolerance keeps a 50 ms tick from missing a 1 s deadline by a float
+    rounding error (1.05 + 1.0 - 2.05 is not exactly 0.0 in binary).
+    """
+    interval_s = max(0, int(interval_ms)) / 1000.0
+    return float(now) - float(last) >= interval_s - 1e-6
 
 
 def _clamp_interval(cadence_ms) -> int:
@@ -1220,24 +1563,34 @@ def set_interest(source, props, cadence_ms=STATE_TIER_INTERVAL_MS) -> bool:
     """
     name = str(source)
     acceptable = [str(prop) for prop in props if str(prop) in SUPPORTED_PROPERTIES]
-    if not acceptable:
-        interest_sources.pop(name, None)
-        return False
-    entry = interest_sources.setdefault(
-        name,
-        {"props": set(), "cadence_ms": STATE_TIER_INTERVAL_MS, "last_poll": 0.0},
-    )
-    entry["props"].update(acceptable)
-    entry["cadence_ms"] = _clamp_interval(cadence_ms)
+    with STATE_LOCK:
+        if not acceptable:
+            interest_sources.pop(name, None)
+            return False
+        entry = interest_sources.setdefault(
+            name,
+            {"props": set(), "cadence_ms": STATE_TIER_INTERVAL_MS, "last_poll": 0.0},
+        )
+        entry["props"].update(acceptable)
+        entry["cadence_ms"] = _clamp_interval(cadence_ms)
     return True
 
 
-def _interest_due_props(now) -> dict[str, set[str]]:
-    """The props each declared source owes at ``now`` (e82s02)."""
+def _interest_due_props(now, tier_due: bool = False) -> dict[str, set[str]]:
+    """The props each declared source owes at ``now`` (e82s02/e03s02).
+
+    When the tier is due, an interest whose next deadline is within one poll
+    tick rides the tier's get instead of firing again a few milliseconds later.
+    This is what keeps a 1 s interest from doubling the gets of that source.
+    """
     due_props: dict[str, set[str]] = {}
     for name, entry in list(interest_sources.items()):
         cadence = entry.get("cadence_ms", STATE_TIER_INTERVAL_MS)
-        if not poll_due(entry.get("last_poll", 0.0), cadence, now):
+        due = poll_due(entry.get("last_poll", 0.0), cadence, now)
+        if not due and tier_due:
+            next_due = float(entry.get("last_poll", 0.0)) + max(0, int(cadence)) / 1000.0
+            due = next_due - float(now) <= (POLL_TICK_MS + 1) / 1000.0
+        if not due:
             continue
         entry["last_poll"] = now
         due_props.setdefault(name, set()).update(entry.get("props") or ())
@@ -1258,30 +1611,34 @@ def interest_poll(now=None) -> int:
     longer resolves is skipped: its name has nothing to ask.
     """
     global _state_tier_last
-    clock = time.time() if now is None else now
-    due_props = _interest_due_props(clock)
-    if poll_due(_state_tier_last, STATE_TIER_INTERVAL_MS, clock):
-        _state_tier_last = clock
-        for data in list(vimix_data.values()):
-            name = data.get("name")
-            if name:
-                due_props.setdefault(str(name), set()).update(STATE_TIER_PROPS)
-    full = interest_full
-    if full.get("active") and poll_due(
-        full.get("last_poll", 0.0), full.get("cadence_ms", STATE_TIER_INTERVAL_MS), clock
-    ):
-        full["last_poll"] = clock
-        for data in list(vimix_data.values()):
-            name = data.get("name")
-            if name:
-                due_props.setdefault(str(name), set()).update(ALL_PROPERTIES)
-        remaining = full.get("remaining")
-        if remaining is not None:
-            full["remaining"] = remaining - 1
-            if full["remaining"] <= 0:
-                full["active"] = False  # e82s08: a ONE-SHOT sweep ends here
+    clock = time.monotonic() if now is None else now
+    with STATE_LOCK:
+        tier_due = poll_due(_state_tier_last, STATE_TIER_INTERVAL_MS, clock)
+        if tier_due:
+            _state_tier_last = clock
+        due_props = _interest_due_props(clock, tier_due)
+        if tier_due:
+            for data in list(vimix_data.values()):
+                name = data.get("name")
+                if name:
+                    due_props.setdefault(str(name), set()).update(STATE_TIER_PROPS)
+        full = interest_full
+        if full.get("active") and poll_due(
+            full.get("last_poll", 0.0), full.get("cadence_ms", STATE_TIER_INTERVAL_MS), clock
+        ):
+            full["last_poll"] = clock
+            for data in list(vimix_data.values()):
+                name = data.get("name")
+                if name:
+                    due_props.setdefault(str(name), set()).update(ALL_PROPERTIES)
+            remaining = full.get("remaining")
+            if remaining is not None:
+                full["remaining"] = remaining - 1
+                if full["remaining"] <= 0:
+                    full["active"] = False  # e82s08: a ONE-SHOT sweep ends here
+        due_snapshot = {name: set(props) for name, props in due_props.items()}
     sent = 0
-    for name, props in due_props.items():
+    for name, props in due_snapshot.items():
         if find_index_by_name(name) is None:
             continue
         for chunk in _chunks(props, INTEREST_MAX_PROPS_PER_GET):
@@ -1290,37 +1647,84 @@ def interest_poll(now=None) -> int:
     return sent
 
 
+def _send_sync(now: float, reason: str) -> bool:
+    """Send /vimix/current/sync through the D5 minimum gap (e03s02).
+
+    Returns True when the message went out. A skipped send is not queued here:
+    the session retry / the next core deadline is the coalescing slot.
+    """
+    global _last_sync_sent, _awaiting_roster, _sync_sent_at
+    with STATE_LOCK:
+        if now - _last_sync_sent < SYNC_MIN_GAP_S:
+            if LOG_LEVEL >= 2:
+                log_bus.emit(f"{COLOR_TIMESTAMP}[SYNC]{COLOR_RESET} {reason} coalesced")
+            return False
+        with contextlib.suppress(Exception):
+            forward_client.send_message("/vimix/current/sync", [])
+            _last_sync_sent = now
+            _awaiting_roster = True
+            _sync_sent_at = now
+            return True
+        return False
+
+
 def request_session_sync(now=None) -> None:
     """Ask vimix for the roster right after a session change (e82s06).
 
     One immediate `sync` (the session command itself produces nothing) and ONE
     retry at SESSION_SYNC_RETRY_MS, because the media load is asynchronous: the
-    retry is what catches a session whose sources appear a beat later.
+    retry is what catches a session whose sources appear a beat later. Both go
+    through the same 500 ms gap (D5); a skipped immediate is replaced by the
+    retry.
     """
-    global _pending_session_sync_at
-    clock = time.time() if now is None else now
-    with contextlib.suppress(Exception):
-        forward_client.send_message("/vimix/current/sync", [])
-    _pending_session_sync_at = clock + SESSION_SYNC_RETRY_MS / 1000.0
+    global _pending_session_sync_at, _awaiting_roster, _sync_sent_at
+    clock = time.monotonic() if now is None else now
+    with STATE_LOCK:
+        _send_sync(clock, "session")
+        _awaiting_roster = True
+        _sync_sent_at = clock
+        _pending_session_sync_at = clock + SESSION_SYNC_RETRY_MS / 1000.0
+
+
+def _check_vimix_compat(clock: float) -> None:
+    """One non-fatal warning when id/type never arrive (Vimix < 0.9.3, e03s03)."""
+    global _vimix_compat_warned
+    if vimix_has_093 or _vimix_compat_warned or not _first_source_at:
+        return
+    if clock - _first_source_at < VIMIX_COMPAT_TIMEOUT_S:
+        return
+    _vimix_compat_warned = True
+    log_bus.emit(
+        f"{COLOR_RESET_EV}[VIMIX COMPAT]{COLOR_RESET} Vimix 0.9.3+ is required "
+        "(id/type are missing); some features are degraded",
+        "error",
+    )
 
 
 def sync_tick(now=None) -> None:
-    """One due-based pass of the single poller (e82s02).
+    """One due-based pass of the single poller (e82s02/e03s02).
 
     The old loop slept ``sync_interval_time`` and did everything at once; a small
     tick lets the 1 s state tier and a 50 ms interest live beside the roster poll.
     Every task keeps its own deadline, so the cadences never drift into each other.
     """
-    global _last_core_sync, _last_monitor_poll, _pending_session_sync_at
-    clock = time.time() if now is None else now
-    if _pending_session_sync_at and clock >= _pending_session_sync_at:
-        _pending_session_sync_at = 0.0
-        with contextlib.suppress(Exception):
-            forward_client.send_message("/vimix/current/sync", [])
-    if poll_due(_last_core_sync, sync_interval_time, clock):
-        _last_core_sync = clock
-        with contextlib.suppress(Exception):
-            forward_client.send_message("/vimix/current/sync", [])
+    global _last_core_sync, _last_monitor_poll, _pending_session_sync_at, _awaiting_roster
+    clock = time.monotonic() if now is None else now
+    need_probe = False
+    with STATE_LOCK:
+        if _pending_session_sync_at and clock >= _pending_session_sync_at:
+            _pending_session_sync_at = 0.0
+            _send_sync(clock, "retry")
+        if poll_due(_last_core_sync, sync_interval_time, clock):
+            _last_core_sync = clock
+            _send_sync(clock, "core")
+        if _awaiting_roster and clock - _sync_sent_at >= SYNC_ROUND_TIMEOUT_S:
+            _awaiting_roster = False
+            need_probe = True
+    if need_probe:
+        start_roster_probe(clock)
+    with contextlib.suppress(Exception):
+        probe_poll(clock)
     with contextlib.suppress(Exception):
         interest_poll(clock)
     if poll_due(_last_monitor_poll, sync_interval_time, clock):
@@ -1331,6 +1735,7 @@ def sync_tick(now=None) -> None:
         watch_poll(clock)
     with contextlib.suppress(Exception):
         flush_state_broadcast(clock)
+    _check_vimix_compat(clock)
 
 
 def watch_poll(now: float | None = None) -> int:
@@ -1340,14 +1745,15 @@ def watch_poll(now: float | None = None) -> int:
     longer resolves is skipped (the reply simply never comes); the registry is
     cleaned by the unsubscribe command or the entry cap.
     """
-    now = time.time() if now is None else now
+    now = time.monotonic() if now is None else now
     due: dict[str, set[str]] = {}
-    for (name, _ip, _port), entry in watched_sources.items():
-        interval_s = max(1, int(entry["interval_ms"])) / 1000.0
-        if now - float(entry.get("last_poll", 0.0)) < interval_s:
-            continue
-        entry["last_poll"] = now
-        due.setdefault(name, set()).update(str(p) for p in entry["props"])
+    with STATE_LOCK:
+        for (name, _ip, _port), entry in list(watched_sources.items()):
+            interval_s = max(1, int(entry["interval_ms"])) / 1000.0
+            if now - float(entry.get("last_poll", 0.0)) < interval_s:
+                continue
+            entry["last_poll"] = now
+            due.setdefault(name, set()).update(str(p) for p in entry["props"])
     for name, props in due.items():
         if find_index_by_name(name) is not None:
             request_source_props(name, sorted(props))
@@ -1427,12 +1833,10 @@ ECHO_ARITY: dict[str, int] = {
 
 
 def _echo_target_index(target_str):
-    """The mirror index a forwarded target names, or None (e82s01)."""
+    """The mirror index a forwarded target names, or None (e82s01/e03s03)."""
     if target_str == "current":
         return source_current
-    if target_str.isdigit():
-        return int(target_str)
-    return find_index_by_name(target_str)
+    return _resolve_target_index(str(target_str))
 
 
 def _echo_values_are_numbers(values) -> bool:
@@ -1473,15 +1877,16 @@ def apply_echo(address, args) -> bool:
     values = list(args) if args else []
     if len(values) != arity or not _echo_values_are_numbers(values):
         return False
-    idx = _echo_target_index(target_str)
-    if idx is None or idx not in vimix_data:
-        return False
-    current = vimix_data[idx].get(prop)
-    new_value = float(values[0]) if arity == 1 else _merge_echo_vector(current, values)
-    if new_value == current:
-        return False
-    vimix_data[idx][prop] = new_value
-    record_change(idx, prop, new_value)
+    with STATE_LOCK:
+        idx = _echo_target_index(target_str)
+        if idx is None or idx not in vimix_data:
+            return False
+        current = vimix_data[idx].get(prop)
+        new_value = float(values[0]) if arity == 1 else _merge_echo_vector(current, values)
+        if new_value == current:
+            return False
+        vimix_data[idx][prop] = new_value
+        record_change(idx, prop, new_value)
     return True
 
 
@@ -1490,69 +1895,95 @@ def process_vimix_current_message(address, args):
     match = re.match(r"^/?vimix/current/(\d+)$", address)
     if match:
         idx = int(match.group(1))
-        if idx == 0:
-            start_new_sync_round()
-        seen_indices.add(idx)
-        val = args[0] if args else None
-        if val in (1, 1.0, "1"):
-            if source_current != idx:
-                source_current = idx
-                record_change(idx, "current", 1.0, kind="current")
-                return True, idx, True
-            return True, idx, False
+        with STATE_LOCK:
+            if idx == 0:
+                start_new_sync_round()
+            seen_indices.add(idx)
+            seen_current.add(idx)
+            val = args[0] if args else None
+            if val in (1, 1.0, "1"):
+                if source_current != idx:
+                    source_current = idx
+                    record_change(idx, "current", 1.0, kind="current")
+                    return True, idx, True
+                return True, idx, False
     return False, None, False
 
 
 def process_vimix_message(address, args):
+    global vimix_has_093, _first_source_at
     match = re.match(r"^/?vimix/([^/]+)/(.+)$", address)
     if match:
         target_str, prop_name = match.group(1), match.group(2)
         if prop_name not in SUPPORTED_PROPERTIES:
             return None
 
-        idx = int(target_str) if target_str.isdigit() else find_index_by_name(target_str)
+        idx = _resolve_target_index(target_str)
         if idx is None:
             return None
         val = args[0] if len(args) == 1 else list(args) if len(args) > 1 else None
 
-        if idx not in vimix_data:
-            vimix_data[idx] = create_empty_vimix_entry()
+        with STATE_LOCK:
+            if idx not in vimix_data:
+                vimix_data[idx] = create_empty_vimix_entry()
 
-        if prop_name == "name":
-            current_name = vimix_data[idx].get("name")
-            if current_name is None:
-                if idx not in known_indices and val:
-                    known_indices.add(idx)
-                    request_uri_once(str(val))
-            elif current_name != val:
-                if LOG_LEVEL >= 1:
-                    log_bus.emit(
-                        f"{COLOR_TIMESTAMP}[NAME]{COLOR_RESET} Source {idx}: "
-                        f"'{current_name}' -> '{val}'"
-                    )
-                if val:
-                    request_uri_once(str(val))
+            if prop_name in ("id", "type") and val is not None:
+                vimix_has_093 = True
 
-        current_val = vimix_data[idx].get(prop_name)
-        is_changed = current_val != val
-        created = prop_name == "name" and current_val is None
-        vimix_data[idx][prop_name] = val
-        if is_changed:
-            record_change(idx, prop_name, val, kind="added" if created else "changed")
-        if is_changed:
-            notify_watchers(idx, prop_name, val)  # e40s05: the targeted fast lane
+            if (
+                prop_name == "id"
+                and target_str.isdigit()
+                and int(target_str) == idx
+                and idx in seen_current
+            ):
+                seen_id.add(idx)
 
-        if is_changed and LOG_LEVEL >= 1:
-            log_bus.emit(
-                f"{COLOR_TIMESTAMP}[VIMIX DATA]{COLOR_RESET} Source {idx} | {prop_name}: {val}"
-            )
+            if (
+                _probe_active
+                and prop_name == "name"
+                and target_str.isdigit()
+                and val
+                and int(target_str) in _probe_requested
+            ):
+                _probe_found[idx] = str(val)
 
-        if prop_name == "uri" and is_changed and val:
-            threading.Thread(
-                target=generate_thumbnails_worker, args=(idx, val), daemon=True
-            ).start()
+            if prop_name == "name":
+                current_name = vimix_data[idx].get("name")
+                if current_name is None:
+                    if not _first_source_at:
+                        _first_source_at = time.monotonic()
+                    if idx not in known_indices and val:
+                        known_indices.add(idx)
+                        request_uri_once(str(val))
+                elif current_name != val:
+                    if LOG_LEVEL >= 1:
+                        log_bus.emit(
+                            f"{COLOR_TIMESTAMP}[NAME]{COLOR_RESET} Source {idx}: "
+                            f"'{current_name}' -> '{val}'"
+                        )
+                    if val:
+                        request_uri_once(str(val))
 
-        return idx, prop_name, val, is_changed
+            current_val = vimix_data[idx].get(prop_name)
+            is_changed = current_val != val
+            created = prop_name == "name" and current_val is None
+            vimix_data[idx][prop_name] = val
+            if is_changed:
+                record_change(idx, prop_name, val, kind="added" if created else "changed")
+            if is_changed:
+                notify_watchers(idx, prop_name, val)  # e40s05: the targeted fast lane
+
+            if is_changed and LOG_LEVEL >= 1:
+                log_bus.emit(
+                    f"{COLOR_TIMESTAMP}[VIMIX DATA]{COLOR_RESET} Source {idx} | {prop_name}: {val}"
+                )
+
+            if prop_name == "uri" and is_changed and isinstance(val, str) and val:
+                threading.Thread(
+                    target=generate_thumbnails_worker, args=(idx, val), daemon=True
+                ).start()
+
+            return idx, prop_name, val, is_changed
     return None
 
 
@@ -1677,21 +2108,37 @@ def warn_busy_ports() -> None:
 
 
 def size_receive_buffer(sock) -> None:
-    """Give a UDP receive socket an explicit buffer (e41s01).
+    """Keep a UDP receive socket at least RECV_BUFFER_BYTES (e41s01).
 
     Best-effort on purpose: a kernel cap or a platform refusing the option must
-    never stop the daemon from serving (Defensive Code, AGENTS.md).
+    never stop the daemon from serving (Defensive Code, AGENTS.md). A kernel
+    default larger than RECV_BUFFER_BYTES is left alone, never shrunk.
     """
     with contextlib.suppress(OSError):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+        current = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        if current < RECV_BUFFER_BYTES:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+
+
+def create_osc_server(ip, port, role_port=None):
+    """Bind the OSC server without serving (boot + tests).
+
+    socketserver defaults max_packet_size to 8192; a Vimix roster for 100
+    sources is ~12.7 KB and was silently cut before python-osc parsed it. The
+    instance attribute keeps the test fakes and the real class on one path.
+    """
+    dispatcher = Dispatcher()
+    handler = create_osc_handler(port if role_port is None else role_port)
+    dispatcher.set_default_handler(handler, needs_reply_address=True)
+    server = BlockingOSCUDPServer((ip, port), dispatcher)
+    server.max_packet_size = MAX_OSC_DATAGRAM_BYTES
+    size_receive_buffer(server.socket)
+    return server
 
 
 def start_server_instance(ip, port):
-    dispatcher = Dispatcher()
-    handler = create_osc_handler(port)
-    dispatcher.set_default_handler(handler, needs_reply_address=True)
     try:
-        server = BlockingOSCUDPServer((ip, port), dispatcher)
+        server = create_osc_server(ip, port)
     except OSError as e:
         # A busy port (usually a second viOSC instance) must surface as a
         # readable log line, not a thread traceback — the app is UI-first.
@@ -1701,31 +2148,60 @@ def start_server_instance(ip, port):
             "error",
         )
         return
-    size_receive_buffer(server.socket)
     server.serve_forever()
 
 
-def verify_dependencies():
-    if shutil.which(FFMPEG_PATH) is None:
-        log_bus.emit(f"ERROR: ffmpeg executable not found ('{FFMPEG_PATH}').", "error")
+def resolve_binary(name: str) -> str | None:
+    """Resolve a bundled/configured/PATH binary, including macOS app bundles."""
+    if os.path.isabs(name) and os.access(name, os.X_OK):
+        return name
+    found = shutil.which(name)
+    if found is not None:
+        return found
+    candidates: list[str] = []
+    if sys.platform == "darwin":
+        candidates.extend(DARWIN_BINARY_DIRS)
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        # Contents/MacOS/viOSC -> Contents/Resources/bin
+        candidates.extend(
+            [
+                os.path.join(exe_dir, "..", "Resources", "bin"),
+                os.path.join(exe_dir, "Resources", "bin"),
+            ]
+        )
+    for directory in candidates:
+        candidate = os.path.join(directory, name)
+        if os.access(candidate, os.X_OK):
+            return os.path.realpath(candidate)
+    return None
+
+
+def verify_dependencies() -> bool:
+    """Resolve ffmpeg/ffprobe; a miss degrades the app, it never exits (e04s01)."""
+    global FFMPEG_PATH, FFPROBE_PATH, FFMPEG_AVAILABLE
+    ffmpeg = resolve_binary(FFMPEG_PATH)
+    ffprobe = resolve_binary(FFPROBE_PATH)
+    if ffmpeg is None or ffprobe is None:
+        FFMPEG_AVAILABLE = False
         log_bus.emit(
-            "Install ffmpeg, or set the VIOSC_FFMPEG environment variable "
-            "to the full path of the executable.",
+            f"ERROR: ffmpeg/ffprobe not found ('{FFMPEG_PATH}' / '{FFPROBE_PATH}').",
             "error",
         )
-        sys.exit(1)
-    if shutil.which(FFPROBE_PATH) is None:
-        log_bus.emit(f"ERROR: ffprobe executable not found ('{FFPROBE_PATH}').", "error")
         log_bus.emit(
-            "Install ffprobe (part of ffmpeg), or set the VIOSC_FFPROBE "
-            "environment variable to the full path of the executable.",
+            "Thumbnails and preview are disabled; the OSC router and the HTTP "
+            "state plane keep running. Install ffmpeg or set VIOSC_FFMPEG/VIOSC_FFPROBE.",
             "error",
         )
-        sys.exit(1)
+        return False
+    FFMPEG_PATH = ffmpeg
+    FFPROBE_PATH = ffprobe
+    FFMPEG_AVAILABLE = True
     # e02s01: resolved paths let the AppImage smoke test assert the bundled
     # binaries are the ones in use (AppRun prepends $APPDIR/usr/bin to PATH).
-    log_bus.emit(f"ffmpeg: {shutil.which(FFMPEG_PATH)}")
-    log_bus.emit(f"ffprobe: {shutil.which(FFPROBE_PATH)}")
+    log_bus.emit(f"ffmpeg: {ffmpeg}")
+    log_bus.emit(f"ffprobe: {ffprobe}")
+    return True
 
 
 def restart_command() -> list[str]:
@@ -1733,14 +2209,17 @@ def restart_command() -> list[str]:
 
     The window closes nothing: os.execv replaces this process with a fresh
     boot of the same script and command-line arguments, so the servers
-    rebind and the GUI reopens with the saved config.
+    rebind and the GUI reopens with the saved config. A frozen bundle
+    (PyInstaller/py2app) is the executable itself; do not pass it as a script.
     """
+    if getattr(sys, "frozen", False):
+        return [sys.executable, *sys.argv[1:]]
     return [sys.executable, os.path.realpath(sys.argv[0]), *sys.argv[1:]]
 
 
 def _report_gui_fatal() -> None:
     """GUI-mode fatal-boot dialog (console is off): show the log tail."""
-    detail = "\n".join(text for text, _level in log_bus.tail(count=25))
+    detail = "\n".join(strip_ansi(text) for text, _level in log_bus.tail(count=25))
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -1841,12 +2320,7 @@ def main():
     if not gui_mode:
         log_bus.subscribe(console_listener, replay=True)
     values, _sources = load_boot_config(args.config)
-    try:
-        verify_dependencies()
-    except SystemExit:
-        if gui_mode:
-            _report_gui_fatal()
-        raise
+    verify_dependencies()
     log_bus.emit(
         "=========================================================================================="
     )
@@ -1913,6 +2387,7 @@ def main():
             apply_interest=apply_interest,
             regen_thumb=regen_thumb_for,
             apply_lane=apply_lane,
+            state_lock=STATE_LOCK,
         )
         threading.Thread(target=preview_server.serve_forever, daemon=True).start()
         if LOG_LEVEL >= 1:
