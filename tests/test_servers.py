@@ -81,6 +81,9 @@ class RecordingSocket:
     def __init__(self):
         self.options = []
 
+    def getsockopt(self, level, option):
+        return 0
+
     def setsockopt(self, level, option, value):
         self.options.append((level, option, value))
 

@@ -90,20 +90,20 @@ def test_the_osc_server_reads_a_whole_datagram():
         server.server_close()
 
 
-def test_a_100_source_bundle_arrives_whole():
-    """The 12.7 KB bundle is cut at 8192 by the old server."""
+def test_an_80_source_bundle_arrives_whole():
+    """The ~8.7 KB bundle is cut at 8192 by the old server and fits macOS UDP."""
     server = viosc.create_osc_server("127.0.0.1", 0, role_port=viosc.FROMVIMIX_PORT)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         port = server.server_address[1]
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.sendto(_bundle(100), ("127.0.0.1", port))
+            sock.sendto(_bundle(80), ("127.0.0.1", port))
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and len(viosc.vimix_data) < 100:
+        while time.monotonic() < deadline and len(viosc.vimix_data) < 80:
             time.sleep(0.01)
-        assert len(viosc.vimix_data) == 100, "the tail must survive the intake"
-        assert viosc.vimix_data[99]["name"] == "source-099"
+        assert len(viosc.vimix_data) == 80, "the tail must survive the intake"
+        assert viosc.vimix_data[79]["name"] == "source-079"
     finally:
         server.shutdown()
         server.server_close()

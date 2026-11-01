@@ -2108,13 +2108,16 @@ def warn_busy_ports() -> None:
 
 
 def size_receive_buffer(sock) -> None:
-    """Give a UDP receive socket an explicit buffer (e41s01).
+    """Keep a UDP receive socket at least RECV_BUFFER_BYTES (e41s01).
 
     Best-effort on purpose: a kernel cap or a platform refusing the option must
-    never stop the daemon from serving (Defensive Code, AGENTS.md).
+    never stop the daemon from serving (Defensive Code, AGENTS.md). A kernel
+    default larger than RECV_BUFFER_BYTES is left alone, never shrunk.
     """
     with contextlib.suppress(OSError):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
+        current = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        if current < RECV_BUFFER_BYTES:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RECV_BUFFER_BYTES)
 
 
 def create_osc_server(ip, port, role_port=None):
