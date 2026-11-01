@@ -149,3 +149,8 @@ jobs:
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
+      - name: Apply the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release edit "${{ github.ref_name }}" --notes-file RELEASE_NOTES_0.9.0.md
