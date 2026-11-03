@@ -7,15 +7,20 @@
 #     (the bundled static binaries are the ones in use),
 #   - no traceback / [SERVER ERROR] / [STARTUP] / ERROR line is printed.
 #
-# Usage: bash scripts/smoke_appimage.sh [VERSION]
+# Usage: [ARCH=x86_64|aarch64] bash scripts/smoke_appimage.sh [VERSION]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="${1:-$(grep -o 'APP_VERSION: str = "[^"]*"' "$ROOT/viosc.py" | cut -d'"' -f2)}"
-APP="$ROOT/dist/viosc-$VERSION-x86_64.AppImage"
+ARCH="${ARCH:-x86_64}"
+case "$ARCH" in
+  x86_64|aarch64) ;;
+  *) echo "ERROR: ARCH must be x86_64 or aarch64 (got '$ARCH')." >&2; exit 1 ;;
+esac
+APP="$ROOT/dist/viosc-$VERSION-$ARCH.AppImage"
 
 if [ ! -x "$APP" ]; then
-  echo "missing $APP — run bash scripts/build_appimage.sh first"
+  echo "missing $APP — run ARCH=$ARCH bash scripts/build_appimage.sh first"
   exit 1
 fi
 
@@ -38,6 +43,6 @@ grep -q "'viOSC' STARTED" "$TMP/out.log" || fail "startup banner missing"
 grep -Eq "ffmpeg: /[^ ]*/usr/bin/ffmpeg$" "$TMP/out.log" || fail "resolved ffmpeg is not the bundled binary"
 grep -Eq "ffprobe: /[^ ]*/usr/bin/ffprobe$" "$TMP/out.log" || fail "resolved ffprobe is not the bundled binary"
 grep -qE "Traceback|\[SERVER ERROR\]|\[STARTUP\]|ERROR:" "$TMP/out.log" && fail "unexpected error output"
-echo "SMOKE PASS: viosc-$VERSION AppImage boots headless with the bundled ffmpeg/ffprobe"
+echo "SMOKE PASS: viosc-$VERSION ($ARCH) AppImage boots headless with the bundled ffmpeg/ffprobe"
 echo "  ffmpeg : $(grep 'ffmpeg:' "$TMP/out.log" | head -1)"
 echo "  ffprobe: $(grep 'ffprobe:' "$TMP/out.log" | head -1)"

@@ -2,26 +2,27 @@
 
 **viOSC** is an OSC router and state mirror for [Vimix](https://github.com/brunoherbelin/vimix). It runs beside Vimix on the same machine, forwards `/vimix/*` commands, mirrors source state, and serves a small HTTP data plane for VJmix or any controller.
 
-**0.9.0 requires Vimix 0.9.3+.** Linux: AppImage or source. macOS: x86_64/arm64 DMG. [Release assets](https://github.com/lupin3rd/viosc/releases/tag/v0.9.0) · [Release notes](RELEASE_NOTES_0.9.0.md).
+**0.9.1 requires Vimix 0.9.3+.** Linux: AppImage (x86_64/aarch64) or source. macOS: x86_64/arm64 DMG. [Release assets](https://github.com/lupin3rd/viosc/releases/tag/v0.9.1) · [Release notes](RELEASE_NOTES_0.9.1.md).
 
 ## Install
 
 ### Linux (AppImage)
 
-Download `viosc-0.9.0-x86_64.AppImage` from the release, then:
+Download `viosc-0.9.1-x86_64.AppImage` (Intel/AMD) or
+`viosc-0.9.1-aarch64.AppImage` (arm64) from the release, then:
 
 ```bash
-chmod +x viosc-0.9.0-x86_64.AppImage
-./viosc-0.9.0-x86_64.AppImage            # GUI
-./viosc-0.9.0-x86_64.AppImage --headless # console daemon
+chmod +x viosc-0.9.1-<arch>.AppImage
+./viosc-0.9.1-<arch>.AppImage            # GUI
+./viosc-0.9.1-<arch>.AppImage --headless # console daemon
 ```
 
 ### macOS
 
-Download `viOSC-0.9.0-x86_64.dmg` or `viOSC-0.9.0-arm64.dmg`.
+Download `viOSC-0.9.1-x86_64.dmg` or `viOSC-0.9.1-arm64.dmg`.
 
 - x86_64 runs on Intel and on Apple Silicon via Rosetta 2.
-- arm64 is a cross-build; layout/arch is CI-verified.
+- arm64 and x86_64 are both built and smoke-tested natively in CI on macOS 15.
 - The app is **unsigned**: right-click → Open, or
   `xattr -dr com.apple.quarantine /Applications/viOSC.app`.
 - Allow incoming connections at the firewall prompt (6666/7001/8686).
@@ -76,7 +77,7 @@ stable across reordering) or plain index. Avoid `#index` targets: Vimix echoes
 them back and viOSC cannot resolve that form.
 
 The legacy `/viosc/*` lanes (`replydata`, `thumb`, `regen_thumb`, `monitor`,
-`watch`, `sync`, `auth`) still work in 0.9.0 and are removed in **0.10.0**.
+`watch`, `sync`, `auth`) still work in 0.9.x and are removed in **0.10.0**.
 Full reference: [`docs/LEGACY_OSC.md`](docs/LEGACY_OSC.md).
 
 ## Pairing
@@ -115,15 +116,17 @@ Other fields (ports, pairing, pruning, thumbnails) are in `config.py` and the GU
 
 ## Build
 
-Linux AppImage:
+Linux AppImage (x86_64 by default; `ARCH=aarch64` for arm64):
 
 ```bash
 bash scripts/build_appimage.sh
 bash scripts/verify_appimage.sh
+
+ARCH=aarch64 bash scripts/build_appimage.sh
+ARCH=aarch64 bash scripts/verify_appimage.sh
 ```
 
-macOS: `Actions → build-macos` (free Intel runner; x64 runtime smoke + arm64
-cross-build), or locally:
+macOS: `Actions → build` (x86_64 on `macos-15-intel`, arm64 on `macos-15`), or locally:
 
 ```bash
 ARCH=arm64 bash scripts/build_macos_app.sh
@@ -140,7 +143,7 @@ Development checks:
 ## Known limitations
 
 - Vimix sends the roster in one UDP datagram; macOS caps a datagram at 9216 B. Very large sessions (~75+ sources) can lose the bundle; viOSC detects it and rebuilds the roster with a per-index probe.
-- macOS arm64 is a cross-build; x86_64 is the runtime-verified artifact and runs on Apple Silicon via Rosetta 2.
+- Both macOS artifacts are runtime-verified in CI; the x86_64 DMG also runs on Apple Silicon via Rosetta 2.
 - The legacy `/viosc/*` OSC lanes are deprecated and removed in 0.10.0.
 - viOSC must run on the same machine as Vimix (localhost, default OSC ports).
 
