@@ -31,7 +31,7 @@ from logbus import bus as log_bus
 from logbus import console_listener, strip_ansi
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.9.0"
+APP_VERSION: str = "0.9.1"
 
 LISTEN_IP = "0.0.0.0"
 LISTEN_PORT = 6666

@@ -2,7 +2,7 @@
 # Layout + headless smoke for the macOS .app (e04s02).
 # Usage: [EXPECTED_ARCH=arm64|x86_64] [SKIP_RUNTIME=1] bash scripts/verify_macos_app.sh [dist/viOSC.app]
 #   EXPECTED_ARCH defaults to arm64. SKIP_RUNTIME skips the headless launch
-#   (used for a cross-built arm64 app on an Intel runner, which cannot run it).
+#   (used when the runner cannot execute the target architecture).
 set -euo pipefail
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -44,8 +44,15 @@ otool -L "$APP/Contents/Resources/bin/ffmpeg" | grep -Eq '/opt/homebrew|/usr/loc
     exit 1
 }
 
+echo "==> Mach-O architecture"
+if find "$APP" -type f -exec file {} + | grep "Mach-O" | grep -v "$EXPECTED_ARCH" >/dev/null; then
+    echo "ERROR: a bundled Mach-O is not $EXPECTED_ARCH:" >&2
+    find "$APP" -type f -exec file {} + | grep "Mach-O" | grep -v "$EXPECTED_ARCH" >&2
+    exit 1
+fi
+
 if [ "${SKIP_RUNTIME:-0}" = "1" ]; then
-    echo "==> SKIP_RUNTIME=1: layout only (cross-built app cannot run here)"
+    echo "==> SKIP_RUNTIME=1: layout only (runtime skipped)"
     echo "==> PASS: layout, $EXPECTED_ARCH, bundled ffmpeg"
     exit 0
 fi
@@ -111,4 +118,4 @@ if [ -s "$LOG" ] && ! grep -q "Contents/Resources/bin/ffmpeg" "$LOG"; then
     echo "WARNING: the headless log did not show the bundled ffmpeg path." >&2
     echo "         (a --windowed bundle may have no stdout; the layout check covers it.)" >&2
 fi
-echo "==> PASS: layout, arm64, bundled ffmpeg, /state 200"
+echo "==> PASS: layout, $EXPECTED_ARCH, bundled ffmpeg, /state 200"
