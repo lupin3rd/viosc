@@ -53,8 +53,9 @@ BASE_FILE="python3.13.17-cp313-cp313-manylinux_2_28_${ARCH}.AppImage"
 BASE_URL="https://github.com/niess/python-appimage/releases/download/python3.13/${BASE_FILE}"
 TOOL_FILE="appimagetool-${TOOL_ARCH}.AppImage"
 TOOL_URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/${TOOL_FILE}"
+RUNTIME_ASSET="runtime-${TOOL_ARCH}"
 RUNTIME_FILE="type2-runtime-${TOOL_ARCH}"
-RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/continuous/${RUNTIME_FILE}"
+RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/continuous/${RUNTIME_ASSET}"
 # Static GPL ffmpeg/ffprobe for linux-${FFMPEG_ARCH}, republished on GitHub by
 # ffmpeg-static (the same pinned b6.1.1 release used by the macOS build).
 # johnvansickle's site is not reliably reachable from CI runners.
