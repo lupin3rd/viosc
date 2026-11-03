@@ -105,3 +105,13 @@ def test_linux_arm64_release_notes_and_version() -> None:
     assert 'APP_VERSION: str = "0.9.1"' in (ROOT / "viosc.py").read_text(encoding="utf-8")
     notes = (ROOT / "RELEASE_NOTES_0.9.1.md").read_text(encoding="utf-8")
     assert "arm64" in notes
+
+
+def test_linux_appimage_runtime_url_matches_asset() -> None:
+    build = (ROOT / "scripts" / "build_appimage.sh").read_text(encoding="utf-8")
+
+    assert 'RUNTIME_ASSET="runtime-${TOOL_ARCH}"' in build
+    assert (
+        'RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/'
+        'continuous/${RUNTIME_ASSET}"' in build
+    )
