@@ -27,7 +27,7 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/config.json" <<'EOF'
-{"listen_port": 8266, "from_vimix_port": 8201, "preview_port": 8286}
+{"from_vimix_port": 8201, "http_port": 8286}
 EOF
 
 set +e
@@ -36,10 +36,19 @@ APPIMAGE_EXTRACT_AND_RUN=1 timeout 6 "$APP" --headless --config "$TMP/config.jso
   > "$TMP/out.log" 2>&1
 RC=$?
 set -e
+# The AppImage wrapper spawns a grandchild (AppRun -> python), and `timeout` only
+# signals its direct child, so a run can leave the daemon listening: the NEXT
+# smoke then fails with "unexpected error output" (port busy) and the operator
+# inherits a stray process. The config path is unique per run, so this cannot
+# touch a real one.
+pkill -f "viosc.py --headless --config $TMP/config.json" 2>/dev/null || true
 
 fail() { echo "SMOKE FAIL: $1"; sed -n '1,40p' "$TMP/out.log"; exit 1; }
 [ "$RC" -eq 124 ] || fail "expected the daemon to keep running until timeout (exit 124), got $RC"
-grep -q "'viOSC' STARTED" "$TMP/out.log" || fail "startup banner missing"
+grep -q "viOSC STARTED" "$TMP/out.log" || fail "startup banner missing"
+# e98: the shipped banner is the 1.0 contract in one line — the smoke asserts the
+# words, not just a heartbeat, because the transport is the release.
+grep -q "OSC toward Vimix" "$TMP/out.log" || fail "banner does not state the OSC-toward-Vimix rule"
 grep -Eq "ffmpeg: /[^ ]*/usr/bin/ffmpeg$" "$TMP/out.log" || fail "resolved ffmpeg is not the bundled binary"
 grep -Eq "ffprobe: /[^ ]*/usr/bin/ffprobe$" "$TMP/out.log" || fail "resolved ffprobe is not the bundled binary"
 grep -qE "Traceback|\[SERVER ERROR\]|\[STARTUP\]|ERROR:" "$TMP/out.log" && fail "unexpected error output"

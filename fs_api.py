@@ -9,7 +9,7 @@ filter, paging, dirs-first order, readable flags) and the file resolver behind
 Security posture (specs/FILE_MANAGER_LATEST.md §7): every request path is
 resolved with ``realpath`` and must stay inside a configured root — a `..`
 escape and a symlink pointing outside are both refused — and nothing here writes.
-The HTTP handler and the Media Roots config live in the daemon / preview_http;
+The HTTP handler and the Media Roots config live in the daemon / http_api;
 this module never imports the daemon.
 """
 

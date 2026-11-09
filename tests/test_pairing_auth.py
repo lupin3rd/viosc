@@ -5,7 +5,7 @@ disabled case) and its enforcement on the :8686 HTTP data plane: POST /auth
 returns a bearer token for the right code, every other request without a valid
 token answers 401, and with pairing off nothing changes.
 
-External boundaries are monkeypatched as in test_preview_http; the HTTP server
+External boundaries are monkeypatched as in test_http_api; the HTTP server
 binds an ephemeral port and is driven with urllib.
 """
 
@@ -18,8 +18,8 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import http_api
 import pairing
-import preview_http
 
 
 class FakeClock:
@@ -89,7 +89,7 @@ def test_gate_osc_peer_authentication_binds_without_a_token():
 
 class AuthServerFixture:
     def __init__(self, gate):
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1",
             0,
             {},

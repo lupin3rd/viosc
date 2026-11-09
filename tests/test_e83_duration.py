@@ -23,7 +23,6 @@ def _clean(monkeypatch):
     viosc.vimix_data.clear()
     viosc.MEDIA_META_CACHE.clear()
     monkeypatch.setattr(viosc, "classify_media_kind", lambda path: "video")
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **kw: False)
     monkeypatch.setattr(viosc.os.path, "exists", lambda path: True)
     yield
     viosc.vimix_data.clear()

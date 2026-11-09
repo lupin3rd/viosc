@@ -33,7 +33,6 @@ def _clean(monkeypatch):
     viosc._probe_requested.clear()
     viosc._probe_found.clear()
     monkeypatch.setattr(viosc, "request_uri_once", lambda *a, **k: None)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **k: False)
     yield
     viosc.vimix_data.clear()
     viosc.known_indices.clear()

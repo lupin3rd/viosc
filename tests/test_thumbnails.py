@@ -147,24 +147,6 @@ def test_empty_frame_logs_reason_and_keeps_cache(capsys, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_regen_handler_keeps_previous_cache(capsys, monkeypatch):
-    seed_source(0, uri="/mnt/fake/media.mp4", thumbs=[b"good-frame"])
-    fake_media_exists(monkeypatch)
-    monkeypatch.setattr(
-        viosc.subprocess,
-        "run",
-        fake_run(ffmpeg_proc=FakeProc(returncode=1, stderr=b"boom")),
-    )
-    monkeypatch.setattr(viosc.threading, "Thread", SyncThread)
-    handler = viosc.create_osc_handler(viosc.LISTEN_PORT)
-
-    handler(("127.0.0.1", 7000), "/viosc/regen_thumb/0")
-
-    assert viosc.vimix_data[0]["thumbnails"] == [b"good-frame"], (
-        "a regen that fails must not wipe the previous good thumbnail"
-    )
-
-
 # ---------------------------------------------------------------------------
 # e10s02 — RED: up to 3 distinct frames per media
 # ---------------------------------------------------------------------------
@@ -246,37 +228,6 @@ def test_generate_worker_stores_up_to_three_frames(capsys, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_ondemand_request_with_empty_cache_regenerates_and_replies(monkeypatch):
-    seed_source(0, uri="/mnt/fake/media.mp4", thumbs=[])
-    viosc.vimix_data[0]["media_kind"] = "video"  # e57s01: other short-circuits
-    fake_media_exists(monkeypatch)
-    monkeypatch.setattr(viosc.subprocess, "run", fake_run())
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, blob: sent.append((addr, blob))
-    )
-
-    viosc.send_thumbnail_blob(0, "all")
-
-    assert sent, "an empty cache with a valid URI must regenerate and reply"
-    addr, blob = sent[0]
-    assert addr == "/viosc/replythumb/0/0"
-    assert len(blob) > 100
-    assert viosc.vimix_data[0]["thumbnails"], "the regenerated frame must be cached"
-
-
-def test_ondemand_request_without_uri_stays_silent(monkeypatch):
-    seed_source(0, uri=None, thumbs=[])
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, blob: sent.append((addr, blob))
-    )
-
-    viosc.send_thumbnail_blob(0, "all")
-
-    assert sent == [], "a source without a URI is unloadable and must stay silent"
-
-
 # ---------------------------------------------------------------------------
 # e57s01 — probe-first: the kind decides the count BEFORE any ffmpeg call
 # ---------------------------------------------------------------------------
@@ -352,14 +303,32 @@ def test_thumbnails_for_other_does_not_regenerate(monkeypatch):
     assert calls == [], "an other source must not re-enter the thumbnail worker"
 
 
-def test_regen_handler_for_other_is_a_noop(monkeypatch):
-    seed_source(0, uri="/mnt/fake/audio.mp4", thumbs=[])
-    fake_media_exists(monkeypatch)
+def test_regen_for_an_other_source_is_a_noop(monkeypatch):
+    """`POST /thumb/regen` (the only regen path since e98s04) refuses 'other'."""
+    seed_source(0, uri="/tmp/audio.mp3", thumbs=[])
+    viosc.vimix_data[0]["name"] = "clip"
+    viosc.vimix_data[0]["media_kind"] = viosc.MEDIA_KIND_OTHER
+    calls = []
+    monkeypatch.setattr(viosc, "generate_thumbnails_worker", lambda i, u: calls.append((i, u)))
+
+    assert viosc.regen_thumb_for("clip") is False
+    assert calls == []
+
+
+def test_regen_for_an_unknown_source_is_a_noop():
+    seed_source(0, uri="/tmp/clip.mp4", thumbs=[])
+    viosc.vimix_data[0]["name"] = "clip"
+    assert viosc.regen_thumb_for("ghost") is False
+    assert viosc.regen_thumb_for("") is False
+
+
+def test_regen_starts_the_worker_for_a_media_source(monkeypatch):
+    seed_source(0, uri="/tmp/clip.mp4", thumbs=[])
+    viosc.vimix_data[0]["name"] = "clip"
+    viosc.vimix_data[0]["media_kind"] = "video"
     calls = []
     monkeypatch.setattr(viosc, "generate_thumbnails_worker", lambda i, u: calls.append((i, u)))
     monkeypatch.setattr(viosc.threading, "Thread", SyncThread)
-    handler = viosc.create_osc_handler(viosc.LISTEN_PORT)
 
-    handler(("127.0.0.1", 7000), "/viosc/regen_thumb/0")
-
-    assert calls == [], "regenerating an other source must be a no-op"
+    assert viosc.regen_thumb_for("clip") is True
+    assert calls == [(0, "/tmp/clip.mp4")]

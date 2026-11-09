@@ -1,37 +1,58 @@
 # viOSC
 
-**viOSC** is an OSC router and state mirror for [Vimix](https://github.com/brunoherbelin/vimix). It runs beside Vimix on the same machine, forwards `/vimix/*` commands, mirrors source state, and serves a small HTTP data plane for VJmix or any controller.
+**viOSC is the Vimix half of [VJmix](https://github.com/lupin3rd/VJmix).** It runs
+beside Vimix on the same machine, speaks Vimix's OSC API, and serves everything
+VJmix needs over HTTP on one port. On its own it does nothing: VJmix is what
+drives it.
 
-**0.9.1 requires Vimix 0.9.3+.** Linux: AppImage (x86_64/aarch64) or source. macOS: x86_64/arm64 DMG. [Release assets](https://github.com/lupin3rd/viosc/releases/tag/v0.9.1) · [Release notes](RELEASE_NOTES_0.9.1.md).
+**viOSC 1.0.0 requires VJmix 1.3.0 and Vimix 0.9.3+.** Linux: AppImage
+(x86_64/aarch64) or source. macOS: x86_64/arm64 DMG.
+[Release assets](https://github.com/lupin3rd/viosc/releases/tag/v1.0.0) ·
+[Release notes](RELEASE_NOTES_1.0.0.md).
+
+## What it does
+
+- **Commands in.** VJmix sends `/vimix/*` commands over HTTP; viOSC forwards
+  them to Vimix verbatim. One long-lived stream, in order, nothing lost.
+- **State out.** viOSC keeps a mirror of the session (every source and its
+  properties) and serves it as a snapshot or as an ordered delta stream.
+- **What Vimix cannot.** Thumbnails, media preview and metadata, a read-only
+  file manager and the configuration are computed or read here and exposed as
+  plain HTTP resources.
+- **Pairing.** A 4-digit code shown in viOSC's window must be exchanged for a
+  bearer token before a controller may use any of it.
+
+The result is one link: HTTP toward VJmix, OSC only toward Vimix.
 
 ## Install
 
 ### Linux (AppImage)
 
-Download `viosc-0.9.1-x86_64.AppImage` (Intel/AMD) or
-`viosc-0.9.1-aarch64.AppImage` (arm64) from the release, then:
+Download `viosc-1.0.0-x86_64.AppImage` (Intel/AMD) or
+`viosc-1.0.0-aarch64.AppImage` (arm64) from the release, then:
 
 ```bash
-chmod +x viosc-0.9.1-<arch>.AppImage
-./viosc-0.9.1-<arch>.AppImage            # GUI
-./viosc-0.9.1-<arch>.AppImage --headless # console daemon
+chmod +x viosc-1.0.0-<arch>.AppImage
+./viosc-1.0.0-<arch>.AppImage            # GUI
+./viosc-1.0.0-<arch>.AppImage --headless # console daemon
 ```
 
 ### macOS
 
-Download `viOSC-0.9.1-x86_64.dmg` or `viOSC-0.9.1-arm64.dmg`.
+Download `viOSC-1.0.0-x86_64.dmg` or `viOSC-1.0.0-arm64.dmg`.
 
 - x86_64 runs on Intel and on Apple Silicon via Rosetta 2.
-- arm64 and x86_64 are both built and smoke-tested natively in CI on macOS 15.
+- Both architectures are built and smoke-tested natively in CI on macOS 15.
 - The app is **unsigned**: right-click → Open, or
   `xattr -dr com.apple.quarantine /Applications/viOSC.app`.
-- Allow incoming connections at the firewall prompt (6666/7001/8686).
+- Allow incoming connections at the firewall prompt (8686; 7001 is loopback).
 
 Both bundles include Python, Tk, python-osc and static ffmpeg/ffprobe.
 
 ### From source
 
-Requires Python 3.10+, Vimix 0.9.3+, `python-osc`, and ffmpeg/ffprobe for thumbnails/preview:
+Requires Python 3.10+, Vimix 0.9.3+, `python-osc`, and ffmpeg/ffprobe for
+thumbnails and preview:
 
 ```bash
 python3 -m venv .venv
@@ -40,79 +61,92 @@ python3 -m venv .venv
 .venv/bin/python viosc.py --headless   # console daemon
 ```
 
-A missing ffmpeg is not fatal: thumbnails/preview are disabled and the OSC/HTTP paths keep running.
+A missing ffmpeg is not fatal: thumbnails and preview are disabled and the
+OSC/HTTP paths keep running.
 
 ## Ports
 
 | Role | Address | Purpose |
 |---|---|---|
-| Input | `0.0.0.0:6666` | Controller commands; `/viosc/*` handled locally, `/vimix/*` forwarded to Vimix |
-| Vimix replies | `127.0.0.1:7001` | Vimix's default OSC send port; the mirror is fed here |
-| Vimix receive | `127.0.0.1:7000` | Vimix's default OSC receive port; the forward target |
-| HTTP data plane | `0.0.0.0:8686` | State, stream, interest, thumbnails, config, files |
+| Vimix replies | `127.0.0.1:7001` | Vimix's OSC send port; the mirror is fed here |
+| Vimix receive | `127.0.0.1:7000` | Vimix's OSC receive port; the forward target |
+| HTTP | `0.0.0.0:8686` | **Everything toward VJmix** |
 
-## HTTP data plane
+Two UDP sockets, both toward Vimix, and one TCP port. That is the whole
+transport surface.
+
+## The HTTP link
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/state` | Whole mirror; `rev` + `ETag`/`304` |
+| `POST` | `/link` | **The command stream**: one long-lived chunked request, one JSON frame per chunk (`{"address": "/vimix/…", "args": [...]}`), with `{"ping": true}` keepalives |
+| `GET` | `/state` | The whole mirror; `rev` + `ETag`/`304` |
 | `GET` | `/events` | Server-Sent Events, one ordered delta per change |
 | `POST` | `/interest` | `{source, props, cadence_ms, once?}`; `"*"` for the full mirror |
 | `GET` | `/thumb/<name>/<index>` | One cached JPEG |
 | `POST` | `/thumb/regen` | `{"source": "<name>"}` |
-| `GET` | `/preview/<name>/{file,meta}` | Media preview/meta |
+| `GET` | `/preview/<name>/{file,meta}` | Media preview and metadata |
 | `GET` | `/fs/...` | Read-only file manager (`/fs/roots`, `/fs/list`, `/fs/meta`, `/fs/raw`) |
-| `GET`/`POST` | `/config` | Effective config / remote-editable fields |
+| `GET`/`POST` | `/config` | Effective config, and the fields a controller may change |
 | `POST` | `/restart` | Apply staged bind changes |
 | `POST` | `/auth` | Exchange the pairing code for a bearer token |
-| `POST` | `/lane` | Mark a consumer active on HTTP (suppresses legacy UDP pushes) |
 
 When pairing is enabled, every request except `POST /auth` needs
 `Authorization: Bearer <token>`.
 
-## OSC
+## OSC toward Vimix
 
-`/vimix/*` is forwarded verbatim to Vimix. Target sources by **name** (preferred;
-stable across reordering) or plain index. Avoid `#index` targets: Vimix echoes
-them back and viOSC cannot resolve that form.
+`/vimix/*` is forwarded to `127.0.0.1:7000` unchanged. Target sources by
+**name** (preferred: stable across reordering) or by plain index. Avoid
+`#index` targets: Vimix echoes that form back and it cannot be resolved.
 
-The legacy `/viosc/*` lanes (`replydata`, `thumb`, `regen_thumb`, `monitor`,
-`watch`, `sync`, `auth`) still work in 0.9.x and are removed in **0.10.0**.
-Full reference: [`docs/LEGACY_OSC.md`](docs/LEGACY_OSC.md).
+## One instance, one window
+
+viOSC takes a lock beside its config (`viosc.lock`) at start: a second launch
+refuses to run ("viOSC is already running, pid N"). Closing the window ends the
+daemon and its servers, which releases the lock — stopping and restarting is
+always one window, never a hidden copy fighting for port 8686.
 
 ## Pairing
 
-viOSC shows a 4-digit code at start. With `pairing_enabled` (default), a peer
-must present it over HTTP `POST /auth` (or OSC `/viosc/auth`) before it can
-drive Vimix or read the data plane. The code expires after
-`pairing_code_ttl_hours` (24 h), is persisted across restarts, and rotates after
-abuse. Pairing is a shared-code gate over plaintext traffic, **not encryption**;
-restrict the ports at the network level for anything stronger.
+viOSC shows a 4-digit code at start. With `pairing_enabled` (the default) a peer
+must present it over HTTP `POST /auth` before it can drive Vimix or read the
+link. The code expires after `pairing_code_ttl_hours` (24 h), survives a
+restart, and rotates after abuse. Pairing is a shared-code gate over plaintext
+traffic, **not encryption**: restrict the port at the network level if you need
+more.
 
 ## Configuration
 
-`~/.config/viosc/config.json` (XDG), precedence **JSON > environment > default**.
-Edit it from the viOSC GUI or from VJmix over HTTP. Key fields:
+`~/.config/viosc/config.json` (XDG); precedence **JSON > environment >
+default**. Editable from the viOSC window or from VJmix over HTTP.
 
 | Field | Default | Notes |
 |---|---|---|
-| `listen_port` | `6666` | Controller input |
 | `from_vimix_port` | `7001` | Vimix replies |
 | `tovimix_port` | `7000` | Vimix receive |
-| `preview_ip` / `preview_port` | `0.0.0.0` / `8686` | HTTP data plane; local-only |
+| `http_ip` / `http_port` | `0.0.0.0` / `8686` | The whole HTTP surface |
 | `ffmpeg_path` / `ffprobe_path` | `ffmpeg` / `ffprobe` | Resolved from PATH, Homebrew/MacPorts and the bundle |
-| `sync_interval_ms` | `2000` | Roster sync; the state tier is 1 s |
+| `sync_interval_ms` | `2000` | Roster cadence; the state tier is 1 s |
 | `pairing_enabled` | `true` | See above |
 
-Other fields (ports, pairing, pruning, thumbnails) are in `config.py` and the GUI.
+Every other field is documented in `config.py` and shown in the window.
 
-## How it works
+## How the mirror stays fresh
 
-- **Roster** — `/vimix/current/sync` every 2 s; Vimix's one-datagram bundle is read whole. A round must be complete (`current/<i>` == `<i>/id`) before pruning; a large drop or a lost bundle is confirmed by an index probe.
-- **State** — one coalesced scheduler: a 1 s tier of 14 properties for every source plus the `/interest` cadence. Session changes get an immediate sync + 500 ms retry; the core sync has a 500 ms minimum gap.
-- **Thumbnails** — `uri` discovery, then ffmpeg JPEG frames for video/image types (10/12); audio/text/sequences are reported as `other`.
-- **Echo** — a forwarded absolute `/vimix/<target>/<prop>` set is applied to the mirror as it passes through.
-- **Mirror** — one lock guards the table, the revision journal and the registries; SSE revisions stay unique.
+- **Roster** — Vimix publishes the session as one bundle; viOSC reads it whole
+  every 2 s. A round must be complete before a source is dropped, and a lost or
+  truncated bundle is confirmed with a per-index probe instead of guessed.
+- **State** — one scheduler asks Vimix for the 9 properties VJmix actually
+  renders (`name`, `alpha`, `blending`, `correction`, `depth`, `play`, `lock`,
+  `speed`, `seek`) once per second, plus whatever a controller declares
+  interested. Geometry and identity are not polled: they are on demand.
+- **Presence** — any request from VJmix counts as a consumer. After 15 s of
+  quiet the tier and the roster stretch to 10 s and declared interests stop
+  firing; the first request after that forces one full round, so a returning
+  VJmix never reads a stale mirror.
+- **Thumbnails and preview** — Vimix's `uri` is discovered per source, then
+  ffmpeg produces the frames viOSC serves and caches.
 
 ## Build
 
@@ -121,31 +155,22 @@ Linux AppImage (x86_64 by default; `ARCH=aarch64` for arm64):
 ```bash
 bash scripts/build_appimage.sh
 bash scripts/verify_appimage.sh
-
-ARCH=aarch64 bash scripts/build_appimage.sh
-ARCH=aarch64 bash scripts/verify_appimage.sh
 ```
 
-macOS: `Actions → build` (x86_64 on `macos-15-intel`, arm64 on `macos-15`), or locally:
+macOS: `Actions → build` (x86_64 on `macos-15-intel`, arm64 on `macos-15`), or
+locally:
 
 ```bash
 ARCH=arm64 bash scripts/build_macos_app.sh
-ARCH=x86_64 bash scripts/build_macos_app.sh
-```
-
-Development checks:
-
-```bash
-.venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy
-.venv/bin/python -m pytest tests/ -q
 ```
 
 ## Known limitations
 
-- Vimix sends the roster in one UDP datagram; macOS caps a datagram at 9216 B. Very large sessions (~75+ sources) can lose the bundle; viOSC detects it and rebuilds the roster with a per-index probe.
-- Both macOS artifacts are runtime-verified in CI; the x86_64 DMG also runs on Apple Silicon via Rosetta 2.
-- The legacy `/viosc/*` OSC lanes are deprecated and removed in 0.10.0.
+- Vimix sends the roster in a single UDP datagram and macOS caps a datagram at
+  9216 B: with ~75+ sources a bundle can be lost. viOSC detects it and rebuilds
+  the roster with an index probe.
 - viOSC must run on the same machine as Vimix (localhost, default OSC ports).
+- The pairing token protects the link, not the wire.
 
 ## Development
 
@@ -153,20 +178,22 @@ Development checks:
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 .venv/bin/python viosc.py --headless
+.venv/bin/ruff check . && .venv/bin/ruff format --check . && .venv/bin/mypy
 .venv/bin/python -m pytest tests/ -q
 .venv/bin/pre-commit install
 ```
 
 ## Related
 
+- [VJmix](https://github.com/lupin3rd/VJmix) — the controller this exists for
 - [Vimix](https://github.com/brunoherbelin/vimix) — the VJ software
 - [Vimix OSC API](https://github.com/brunoherbelin/vimix/wiki/Open-Sound-Control-API)
-- VJmix — the reference controller
 
 ## Support
 
 viOSC is free and GPL-3.0. If it is useful, you can
-[buy me a coffee](https://buymeacoffee.com/lupin3rd) — a thank-you, never a requirement.
+[buy me a coffee](https://buymeacoffee.com/lupin3rd) — a thank-you, never a
+requirement.
 
 ## License
 

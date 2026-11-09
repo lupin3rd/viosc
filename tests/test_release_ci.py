@@ -6,6 +6,7 @@ a version-agnostic release job, and a verifier that reports and checks the
 architecture it actually built.
 """
 
+import re
 from pathlib import Path
 
 import yaml
@@ -101,10 +102,21 @@ def test_linux_appimage_matrix_includes_arm64() -> None:
         assert "dist/viosc-$VERSION-$ARCH.AppImage" in text
 
 
-def test_linux_arm64_release_notes_and_version() -> None:
-    assert 'APP_VERSION: str = "0.9.1"' in (ROOT / "viosc.py").read_text(encoding="utf-8")
-    notes = (ROOT / "RELEASE_NOTES_0.9.1.md").read_text(encoding="utf-8")
-    assert "arm64" in notes
+def test_the_shipped_version_has_its_release_notes() -> None:
+    """e98/e99: APP_VERSION names the current release; its note exists.
+
+    The version is read from the source instead of pinned here (e99s03): a bump
+    used to break this test for no reason, so the only real contract is "the
+    version you ship has a note, and the 1.0.0 note still names its consumer".
+    """
+    source = (ROOT / "viosc.py").read_text(encoding="utf-8")
+    match = re.search(r'APP_VERSION: str = "(\d+\.\d+\.\d+)"', source)
+    assert match, "APP_VERSION must be declared as a literal"
+    notes_file = ROOT / f"RELEASE_NOTES_{match.group(1)}.md"
+    assert notes_file.is_file(), f"no release notes for {match.group(1)}"
+    assert "0.9.1" in (ROOT / "RELEASE_NOTES_0.9.1.md").read_text(encoding="utf-8")
+    notes = (ROOT / "RELEASE_NOTES_1.0.0.md").read_text(encoding="utf-8")
+    assert "VJmix 1.3.0" in notes, "the breaking change names the consumer version"
 
 
 def test_linux_appimage_runtime_url_matches_asset() -> None:
@@ -115,3 +127,20 @@ def test_linux_appimage_runtime_url_matches_asset() -> None:
         'RUNTIME_URL="https://github.com/AppImage/type2-runtime/releases/download/'
         'continuous/${RUNTIME_ASSET}"' in build
     )
+
+
+def test_every_root_module_is_bundled_into_the_appimage() -> None:
+    """The artifact's module list, checked against the tree (regression 1.0.0).
+
+    `instancelock.py` was added for "one viOSC per machine" and the explicit copy
+    list was not updated, so the 1.0.0 AppImage died on `import instancelock` at
+    boot — a defect no daemon test can see, because the tests always run from the
+    source tree. This test is the cheap half of that gate: a module that is not
+    in MODULES fails here, in preflight, instead of at the release smoke.
+    """
+    build = (ROOT / "scripts" / "build_appimage.sh").read_text(encoding="utf-8")
+    block = re.search(r"MODULES=\((.*?)\)\n", build, re.S)
+    assert block, "build_appimage.sh must declare its bundled modules as MODULES=(...)"
+    listed = set(block.group(1).split())
+    shipped = {path.name for path in ROOT.glob("*.py")}
+    assert shipped - listed == set(), f"modules missing from the artifact: {shipped - listed}"

@@ -66,8 +66,8 @@ def test_non_vimix_ingest_does_not_mark():
     viosc.last_vimix_seen = None
     viosc.vimix_messages = 0
 
-    handler = viosc.create_osc_handler(viosc.LISTEN_PORT)
-    handler(("127.0.0.1", 6666), "/viosc/sync/0", "all")
+    handler = viosc.create_osc_handler(viosc.FROMVIMIX_PORT)
+    handler(("127.0.0.1", 7001), "/viosc/sync/0", "all")
 
     assert viosc.vimix_messages == 0
     assert viosc.last_vimix_seen is None

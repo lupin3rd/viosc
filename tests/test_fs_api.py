@@ -4,7 +4,7 @@ Covers the pure half: Media Roots expansion/containment (realpath, symlink
 escape, `..`), media classification by vimix's own extension list, directory
 listing (hidden filter, paging, dirs-first order, unreadable entries) and the
 file resolver used by /fs/raw and /fs/meta. The HTTP routes live in the
-preview_http tests; this file is pure filesystem logic on tmp_path.
+http_api tests; this file is pure filesystem logic on tmp_path.
 
 Headless: standard library only, no daemon, no network, no display.
 """

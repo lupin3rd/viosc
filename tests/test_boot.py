@@ -45,8 +45,8 @@ def make_values(**overrides):
 def test_boot_applies_live_fields_to_module_state(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
     values = make_values(
-        ui_ip="10.0.0.9",
-        reply_port=6699,
+        tovimix_ip="10.0.0.9",
+        tovimix_port=6699,
         log_level=0,
         sync_interval_ms=500,
         ffmpeg_path="/opt/bin/ffmpeg",
@@ -55,8 +55,8 @@ def test_boot_applies_live_fields_to_module_state(monkeypatch):
 
     viosc.boot(values)
 
-    assert viosc.UI_IP == "10.0.0.9"
-    assert viosc.REPLY_PORT == 6699
+    assert viosc.TOVIMIX_IP == "10.0.0.9"
+    assert viosc.TOVIMIX_PORT == 6699
     assert viosc.LOG_LEVEL == 0
     assert viosc.sync_interval_time == 500
     assert viosc.FFMPEG_PATH == "/opt/bin/ffmpeg"
@@ -66,18 +66,16 @@ def test_boot_applies_live_fields_to_module_state(monkeypatch):
 def test_boot_applies_restart_fields_to_module_state(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
     values = make_values(
-        listen_port=7777,
         from_vimix_port=7555,
-        preview_ip="0.0.0.0",
-        preview_port=9090,
+        http_ip="0.0.0.0",
+        http_port=9090,
     )
 
     viosc.boot(values)
 
-    assert viosc.LISTEN_PORT == 7777
     assert viosc.FROMVIMIX_PORT == 7555
-    assert viosc.PREVIEW_IP == "0.0.0.0"
-    assert viosc.PREVIEW_PORT == 9090
+    assert viosc.HTTP_IP == "0.0.0.0"
+    assert viosc.HTTP_PORT == 9090
 
 
 # ---------------------------------------------------------------------------
@@ -108,11 +106,12 @@ def test_boot_recreates_clients_with_booted_destinations(monkeypatch):
     FakeClient.instances = []
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
 
-    viosc.boot(make_values(ui_ip="10.0.0.9", tovimix_ip="10.1.1.1"))
+    viosc.boot(make_values(tovimix_ip="10.1.1.1", tovimix_port=7005))
 
     destinations = set(FakeClient.instances)
-    assert ("10.1.1.1", viosc.TOVIMIX_PORT) in destinations
-    assert ("10.0.0.9", viosc.REPLY_PORT) in destinations
+    assert ("10.1.1.1", 7005) in destinations
+    # e98s04: one OSC client left — the push lane toward VJmix is gone.
+    assert len(destinations) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -121,25 +120,26 @@ def test_boot_recreates_clients_with_booted_destinations(monkeypatch):
 
 
 def test_boot_respects_json_over_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("VIOSC_UI_IP", "10.8.8.8")
+    monkeypatch.setenv("VIOSC_HTTP_PORT", "9999")
     monkeypatch.setenv("VIOSC_FFMPEG", "/env/bin/ffmpeg")
     cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(json.dumps({"ui_ip": "10.9.9.9"}))
+    cfg_path.write_text(json.dumps({"http_port": 9091}))
 
     values, _, _ = config.load_effective(str(cfg_path))
     viosc.boot(values)
 
-    assert viosc.UI_IP == "10.9.9.9", "JSON must win over the env var"
+    assert viosc.HTTP_PORT == 9091, "JSON must win over the env var"
     assert viosc.FFMPEG_PATH == "/env/bin/ffmpeg", "env wins where JSON has no key"
 
 
 def test_boot_with_no_config_keeps_defaults(monkeypatch):
     env_vars = (
         "VIOSC_UI_IP",
+        "VIOSC_PREVIEW_PORT",
         "VIOSC_FFMPEG",
         "VIOSC_FFPROBE",
-        "VIOSC_PREVIEW_IP",
-        "VIOSC_PREVIEW_PORT",
+        "VIOSC_HTTP_IP",
+        "VIOSC_HTTP_PORT",
     )
     for var in env_vars:
         monkeypatch.delenv(var, raising=False)
@@ -147,8 +147,8 @@ def test_boot_with_no_config_keeps_defaults(monkeypatch):
     values, _, _ = config.load_effective("/nonexistent/config.json")
     viosc.boot(values)
 
-    assert viosc.LISTEN_PORT == 6666
-    assert viosc.UI_IP == "127.0.0.1"
+    assert viosc.HTTP_PORT == 8686
+    assert viosc.TOVIMIX_IP == "127.0.0.1"
     assert viosc.FFMPEG_PATH == "ffmpeg"
 
 

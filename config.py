@@ -22,8 +22,6 @@ from typing import Any
 #   boot    - bound at boot (semaphore): apply on next launch
 FIELD_SPEC: dict[str, dict[str, Any]] = {
     # Group A — restart required (server bind ports/IPs)
-    "listen_ip": {"group": "restart", "type": "ip", "default": "0.0.0.0", "attr": "LISTEN_IP"},
-    "listen_port": {"group": "restart", "type": "port", "default": 6666, "attr": "LISTEN_PORT"},
     "local_bind_ip": {
         "group": "restart",
         "type": "ip",
@@ -36,25 +34,23 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "default": 7001,
         "attr": "FROMVIMIX_PORT",
     },
-    "preview_ip": {
+    "http_ip": {
         "group": "restart",
         "type": "ip",
         "default": "0.0.0.0",
-        "attr": "PREVIEW_IP",
+        "attr": "HTTP_IP",
         "local_only": True,
     },
-    "preview_port": {
+    "http_port": {
         "group": "restart",
         "type": "port",
         "default": 8686,
-        "attr": "PREVIEW_PORT",
+        "attr": "HTTP_PORT",
         "local_only": True,
     },
     # Group B — live apply (client destinations + per-use knobs)
     "tovimix_ip": {"group": "live", "type": "ip", "default": "127.0.0.1", "attr": "TOVIMIX_IP"},
     "tovimix_port": {"group": "live", "type": "port", "default": 7000, "attr": "TOVIMIX_PORT"},
-    "ui_ip": {"group": "live", "type": "ip", "default": "127.0.0.1", "attr": "UI_IP"},
-    "reply_port": {"group": "live", "type": "port", "default": 6667, "attr": "REPLY_PORT"},
     "ffmpeg_path": {"group": "live", "type": "path", "default": "ffmpeg", "attr": "FFMPEG_PATH"},
     "ffprobe_path": {"group": "live", "type": "path", "default": "ffprobe", "attr": "FFPROBE_PATH"},
     "log_level": {"group": "live", "type": "level", "default": 1, "attr": "LOG_LEVEL"},
@@ -69,12 +65,6 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "type": "seconds",
         "default": 0.5,
         "attr": "PRUNE_DELAY_SEC",
-    },
-    "monitor_max_misses": {
-        "group": "live",
-        "type": "count",
-        "default": 3,
-        "attr": "MONITOR_MAX_MISSES",
     },
     "thumb_max_count": {"group": "live", "type": "count", "default": 3, "attr": "THUMB_MAX_COUNT"},
     # Group C — restart required (semaphore bound at boot)
@@ -183,28 +173,43 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
 
 DEFAULTS: dict[str, Any] = {k: spec["default"] for k, spec in FIELD_SPEC.items()}
 
+# e98s03: the 1.0 rename. `preview_*` described a feature that is now the whole
+# surface, so the fields are `http_*`; the old keys still load (the new one wins
+# when both are present) and are never written back.
+LEGACY_ALIASES: dict[str, str] = {"preview_ip": "http_ip", "preview_port": "http_port"}
+# e98s04: fields the 1.0 daemon no longer has. They are dropped on load WITHOUT a
+# per-key warning (an upgraded install would otherwise print five "unknown key"
+# lines at every boot) and stripped on the next write.
+RETIRED_FIELDS: dict[str, str] = {
+    "listen_ip": "the VJmix command input is HTTP (POST /link)",
+    "listen_port": "the VJmix command input is HTTP (POST /link)",
+    "ui_ip": "nothing is pushed to VJmix (GET /events)",
+    "reply_port": "nothing is pushed to VJmix (GET /events)",
+    "monitor_max_misses": "the legacy monitor lane is gone",
+}
+# Same for the env override names, which predate the rename.
+ENV_LEGACY_ALIASES: dict[str, str] = {
+    "VIOSC_PREVIEW_IP": "VIOSC_HTTP_IP",
+    "VIOSC_PREVIEW_PORT": "VIOSC_HTTP_PORT",
+}
+
 # Form visibility tiers (e01s07, user decision 2026-09-08 — option B):
 #   essential — everyday wiring, always in the main form
 #   advanced  — less common ports/knobs, behind the 'Advanced settings' toggle
 #   hidden    — JSON-only: auto-resolved (ffmpeg/ffprobe) or internal tuning;
 #               still honoured when present in the config file, never shown
 VISIBILITY: dict[str, str] = {
-    "listen_ip": "advanced",
-    "listen_port": "essential",
     "local_bind_ip": "hidden",
     "from_vimix_port": "hidden",
-    "preview_ip": "advanced",
-    "preview_port": "essential",
+    "http_ip": "advanced",
+    "http_port": "essential",
     "tovimix_ip": "hidden",
     "tovimix_port": "hidden",
-    "ui_ip": "essential",
-    "reply_port": "essential",
     "ffmpeg_path": "hidden",
     "ffprobe_path": "hidden",
     "log_level": "hidden",
     "sync_interval_ms": "advanced",
     "prune_delay_sec": "hidden",
-    "monitor_max_misses": "hidden",
     "thumb_max_count": "advanced",
     "thumb_max_concurrency": "hidden",
     "pairing_enabled": "essential",
@@ -272,11 +277,10 @@ def daemon_attr(key: str) -> str:
 
 # Legacy env override mechanism, honored only where the JSON has no key.
 ENV_VAR_MAP: dict[str, str] = {
-    "ui_ip": "VIOSC_UI_IP",
     "ffmpeg_path": "VIOSC_FFMPEG",
     "ffprobe_path": "VIOSC_FFPROBE",
-    "preview_ip": "VIOSC_PREVIEW_IP",
-    "preview_port": "VIOSC_PREVIEW_PORT",
+    "http_ip": "VIOSC_HTTP_IP",
+    "http_port": "VIOSC_HTTP_PORT",
 }
 
 _MIN_PORT = 1
@@ -403,10 +407,17 @@ def parse_form(
 
 
 def _env_values(env) -> dict[str, Any]:
-    """Env overrides, coerced into schema types (env vars arrive as strings)."""
+    """Env overrides, coerced into schema types (env vars arrive as strings).
+
+    A legacy env name (`VIOSC_PREVIEW_*`) still wins when the renamed one is
+    absent: env support predates the 1.0 rename and scripts may still set it.
+    """
     env_values: dict[str, Any] = {}
     for key, env_var in ENV_VAR_MAP.items():
         raw = env.get(env_var)
+        if raw is None or raw == "":
+            legacy = next((old for old, new in ENV_LEGACY_ALIASES.items() if new == env_var), None)
+            raw = env.get(legacy) if legacy else None
         if raw is None or raw == "":
             continue
         coerced = _coerce(key, raw)
@@ -524,7 +535,16 @@ def effective(
             continue
         values[key] = raw
         sources[key] = "env"
+    retired = [key for key in (base_json or {}) if key in RETIRED_FIELDS]
+    if retired:
+        warnings.append("config: dropped retired field(s): " + ", ".join(sorted(retired)))
     for key, raw in (base_json or {}).items():
+        if key in RETIRED_FIELDS:
+            continue
+        if key in LEGACY_ALIASES:
+            key = LEGACY_ALIASES[key]
+            if key in (base_json or {}):
+                continue  # the renamed key wins when both are present
         if key not in FIELD_SPEC:
             warnings.append(f"config: unknown key '{key}' ignored")
             continue
@@ -597,6 +617,12 @@ def merge_save(path: str, changes: dict[str, Any]) -> None:
                 base = loaded
         except (OSError, json.JSONDecodeError):
             base = {}
+    # e98s03: a write normalizes the rename. The old keys are load-only; leaving
+    # them in the file would keep the alias alive for ever.
+    for legacy in LEGACY_ALIASES:
+        base.pop(legacy, None)
+    for retired in RETIRED_FIELDS:
+        base.pop(retired, None)
     base.update(changes)
     save(path, base)
 

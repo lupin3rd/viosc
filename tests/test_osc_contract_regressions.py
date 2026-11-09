@@ -1,16 +1,16 @@
-"""Frozen-OSC-surface regression guards (e41s01 task 3).
+"""Frozen-OSC-surface regression guards (e41s01, rewritten for e98s04).
 
-e41s01 changed WHEN the state broadcast goes out (coalesced inside a window),
-so the surfaces a mistake would silently break are the ones that share the
-handler: the verbatim ``/vimix/*`` passthrough (the frozen contract's upstream)
-and the monitor registry. The suite had no coverage for either — these are
-characterisation tests: they pin the CURRENT behaviour so the coalescing can
-never quietly reroute or swallow it.
+The frozen contract is between viOSC and Vimix, and since 1.0 its upstream is the
+HTTP command stream: `POST /link` frames are the ONLY thing that becomes a
+`/vimix/*` message. These characterisation tests pin that path — address, argument
+order and argument types must survive the JSON round trip untouched — and they pin
+the converse: nothing that arrives from Vimix is ever echoed back out.
 
-No Vimix and no network: the handler is called directly and both OSC clients are
-recording fakes.
+No Vimix and no network: the frames are decoded directly and the forward client is
+a recording fake.
 """
 
+import json
 import os
 import sys
 
@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
+import pairing
 import viosc
 
 
@@ -35,60 +36,99 @@ class FakeUDPClient:
 
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
-    monkeypatch.setattr(viosc, "_last_state_broadcast_at", 0.0, raising=False)
-    monkeypatch.setattr(viosc, "_state_broadcast_pending", False, raising=False)
-    monkeypatch.setattr(viosc, "ui_reply_client", FakeUDPClient(viosc.UI_IP, viosc.REPLY_PORT))
     monkeypatch.setattr(viosc, "forward_client", FakeUDPClient("127.0.0.1", 7000))
     viosc.vimix_data.clear()
     viosc.source_current = None
-    saved_monitors = dict(viosc.monitored_sources)
-    viosc.monitored_sources.clear()
     yield
     viosc.vimix_data.clear()
-    viosc.monitored_sources.clear()
-    viosc.monitored_sources.update(saved_monitors)
 
 
-def _handler(port=None):
-    return viosc.create_osc_handler(port if port is not None else viosc.LISTEN_PORT)
+def _frame(payload):
+    viosc.apply_link_frame(json.dumps(payload).encode("utf-8"))
 
 
 def test_vimix_commands_are_forwarded_verbatim():
-    _handler()(("10.0.0.2", 5), "/vimix/clip.mp4/alpha", 0.5)
+    _frame({"address": "/vimix/clip.mp4/alpha", "args": [0.5]})
 
     assert viosc.forward_client.messages == [("/vimix/clip.mp4/alpha", [0.5])]
 
 
-def test_vimix_multi_argument_command_keeps_its_payload():
-    _handler()(("10.0.0.2", 5), "/vimix/clip.mp4/position", 0.25, 0.75)
+def test_vimix_multi_argument_command_keeps_its_payload_and_order():
+    _frame({"address": "/vimix/clip.mp4/position", "args": [0.25, 0.75]})
 
     assert viosc.forward_client.messages == [("/vimix/clip.mp4/position", [0.25, 0.75])]
 
 
-def test_viosc_addresses_are_not_forwarded_to_vimix():
-    _handler()(("10.0.0.2", 5), "/viosc/thumb/clip.mp4", "all")
+def test_argument_types_survive_the_json_round_trip():
+    _frame({"address": "/vimix/clip.mp4/alpha", "args": [1]})
+    _frame({"address": "/vimix/clip.mp4/alpha", "args": [1.0]})
+    _frame({"address": "/vimix/clip.mp4/name", "args": ["a name with spaces"]})
 
-    assert all(address.startswith("/vimix/") for address, _ in viosc.forward_client.messages)
-
-
-def test_monitor_subscribe_and_stop_unchanged():
-    handler = _handler()
-
-    handler(("10.0.0.2", 5), "/viosc/monitor/clip.mp4", "alpha", "play")
-    assert viosc.monitored_sources["clip.mp4"] == ["alpha", "play"]
-    assert viosc.forward_client.messages[-1] == (
-        "/vimix/clip.mp4/get",
-        ["alpha", "play"],
-    )
-
-    handler(("10.0.0.2", 5), "/viosc/monitor/clip.mp4")
-    assert "clip.mp4" not in viosc.monitored_sources
+    (first, second, third) = viosc.forward_client.messages
+    assert isinstance(first[1][0], int)
+    assert isinstance(second[1][0], float)
+    assert third[1][0] == "a name with spaces"
 
 
-def test_monitor_subscribe_still_reaches_the_ui():
-    _handler()(("10.0.0.2", 5), "/viosc/monitor/clip.mp4", "alpha")
+def test_a_keepalive_is_not_a_command():
+    _frame({"ping": True})
 
-    sent = [
-        message for message in viosc.ui_reply_client.messages if message[0] == "/viosc/replydata"
-    ]
-    assert len(sent) == 1
+    assert viosc.forward_client.messages == []
+
+
+def test_an_address_without_arguments_is_forwarded_as_a_trigger():
+    _frame({"address": "/vimix/current/next"})
+
+    assert viosc.forward_client.messages == [("/vimix/current/next", [])]
+
+
+def test_the_vimix_side_is_never_forwarded_back(monkeypatch):
+    """A bundle from Vimix is ingested: the forward lane must stay silent."""
+    handler = viosc.create_osc_handler(viosc.FROMVIMIX_PORT)
+    handler(("127.0.0.1", 7001), "/vimix/current/0", 1)
+    handler(("127.0.0.1", 7001), "/vimix/0/alpha", 0.4)
+
+    assert viosc.forward_client.messages == []
+
+
+# ---------------------------------------------------------------------------
+# BUG-2026-11-08 — the pairing gate must not starve the Vimix ingest lane
+# ---------------------------------------------------------------------------
+
+
+def _armed_gate(monkeypatch):
+    gate = pairing.PairingGate(True, "1234", pairing.PeerRegistry(60), 300)
+    monkeypatch.setattr(viosc, "PAIRING_GATE", gate)
+    return gate
+
+
+def test_vimix_is_heard_before_any_controller_pairs(monkeypatch):
+    """viOSC talks to Vimix from the first packet, not after VJmix pairs.
+
+    The pairing gate protects the CONTROLLER lanes. Vimix is the local OSC
+    upstream, so its replies must never be dropped for lack of a pairing: the
+    operator saw the mirror stay empty until VJmix connected over HTTP.
+    """
+    _armed_gate(monkeypatch)
+    before = viosc.vimix_messages
+
+    handler = viosc.create_osc_handler(viosc.FROMVIMIX_PORT)
+    handler(("127.0.0.1", 7001), "/vimix/current/0", 1)
+
+    assert viosc.vimix_messages == before + 1
+
+
+def test_an_unpaired_peer_still_cannot_drive_the_controller_lane(monkeypatch):
+    """The gate keeps its job: /viosc/* needs the code, the Vimix lane does not."""
+    gate = _armed_gate(monkeypatch)
+    started = []
+    monkeypatch.setattr(viosc, "generate_thumbnails_worker", lambda *a: started.append(a))
+    viosc.vimix_data[0] = {"uri": "/tmp/clip.mp4", "media_kind": "video"}
+    handler = viosc.create_osc_handler(viosc.FROMVIMIX_PORT)
+
+    handler(("10.0.0.9", 5000), "/viosc/regen_thumb/0")
+    assert started == []
+
+    gate.authenticate_peer("1234", "10.0.0.9")
+    handler(("10.0.0.9", 5000), "/viosc/regen_thumb/0")
+    assert started == [(0, "/tmp/clip.mp4")]

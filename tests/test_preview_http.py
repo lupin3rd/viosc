@@ -19,7 +19,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import preview_http
+import http_api
 import viosc
 
 
@@ -37,7 +37,7 @@ class PreviewServerFixture:
     """A running preview HTTP server on an ephemeral port for one test."""
 
     def __init__(self, tmp_path):
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1", 0, viosc.vimix_data, lambda p: viosc.probe_media_meta(p)
         )
         self.port = self.httpd.server_address[1]
@@ -229,45 +229,36 @@ def test_meta_probe_failure_returns_404(srv, monkeypatch):
 # --- Task 3: additive media_kind at discovery time ------------------------
 
 
-def test_publish_media_kind_sets_entry_and_broadcasts(srv, monkeypatch):
+def test_publish_media_kind_sets_entry_and_records_the_change(srv, monkeypatch):
+    """e98s04: no broadcast to assert — the change reaches /events."""
     path = srv.media_file(name="clip.mp4")
     seed_source(uri=path)
     monkeypatch.setattr(viosc, "probe_media_meta", lambda p: dict(VIDEO_META))
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, args: sent.append((addr, args))
-    )
+    before = viosc.state_rev
     viosc.publish_media_kind(0, path)
     assert viosc.vimix_data[0]["media_kind"] == "video"
-    assert len(sent) == 1
-    payload = json.loads(sent[0][1][0])
-    assert payload["sources"]["0"]["media_kind"] == "video"
+    assert viosc.state_rev > before
+    assert json.loads(viosc.state_json())["sources"]["0"]["media_kind"] == "video"
 
 
 def test_publish_media_kind_skips_missing_file(srv, monkeypatch):
     seed_source(uri="/definitely/not/here.mp4")
     monkeypatch.setattr(viosc, "probe_media_meta", lambda p: dict(VIDEO_META))
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, args: sent.append((addr, args))
-    )
+    before = viosc.state_rev
     viosc.publish_media_kind(0, "/definitely/not/here.mp4")
     # e57s01: the entry is seeded other; a missing file keeps it (transient)
     assert viosc.vimix_data[0]["media_kind"] == viosc.MEDIA_KIND_OTHER
-    assert sent == []
+    assert viosc.state_rev == before
 
 
 def test_publish_media_kind_leaves_non_media_entries_untouched(srv, monkeypatch):
     seed_source(name="shader", uri=None)
     monkeypatch.setattr(viosc, "probe_media_meta", lambda p: dict(VIDEO_META))
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, args: sent.append((addr, args))
-    )
+    before = viosc.state_rev
     viosc.publish_media_kind(0, None)
-    # e57s01: no uri means other, and there is nothing to re-broadcast
+    # e57s01: no uri means other, and there is nothing to publish
     assert viosc.vimix_data[0]["media_kind"] == viosc.MEDIA_KIND_OTHER
-    assert sent == []
+    assert viosc.state_rev == before
 
 
 def test_entry_seeded_other_flips_to_video_when_uri_arrives(srv, monkeypatch):
@@ -277,12 +268,9 @@ def test_entry_seeded_other_flips_to_video_when_uri_arrives(srv, monkeypatch):
     path = srv.media_file(name="clip.mp4")
     entry["uri"] = path
     monkeypatch.setattr(viosc, "probe_media_meta", lambda p: dict(VIDEO_META))
-    sent = []
-    monkeypatch.setattr(
-        viosc.ui_reply_client, "send_message", lambda addr, args: sent.append((addr, args))
-    )
+    before = viosc.state_rev
 
     viosc.publish_media_kind(0, path)
 
     assert entry["media_kind"] == "video"
-    assert len(sent) == 1, "the flip must be broadcast"
+    assert viosc.state_rev > before, "the flip must reach the delta stream"

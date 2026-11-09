@@ -30,7 +30,7 @@ echo "==> extracting artifact layout"
 DIR="$WORK/squashfs-root"
 
 fail() { echo "VERIFY FAIL: $1"; exit 1; }
-for module in viosc.py config.py logbus.py viosc_gui.py preview_http.py fs_api.py mix_schema.py pairing.py; do
+for module in viosc.py config.py logbus.py viosc_gui.py http_api.py fs_api.py mix_schema.py pairing.py; do
   [ -f "$DIR/opt/viosc/$module" ] || fail "missing opt/viosc/$module"
 done
 [ -x "$DIR/usr/bin/ffmpeg" ] || fail "missing bundled usr/bin/ffmpeg"

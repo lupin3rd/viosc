@@ -1,12 +1,17 @@
-"""HTTP data-plane surface for viosc (e38s01, e41s03) — the A-side transport.
+"""The HTTP API of viosc — the A-side transport (e38s01 … e98s01).
 
-Serves the media files that vimix media sources point to over HTTP with a
-correct RFC 7233 Range implementation (206 + Content-Range + Accept-Ranges,
-416 on bad ranges, 200 full without Range), plus an ffprobe-backed /meta
-endpoint, plus (e41s03) one cached thumbnail frame per request. Sources are
-addressed by NAME through the daemon's live state table (address-by-name, like
-the OSC surface); a name that is not a media source (no uri) returns 404 and no
-path is ever opened from the request itself (no traversal surface).
+Since 1.0 this module is not "the preview server": it is the only surface toward
+VJmix. It carries the state snapshot and its delta stream, the read-only
+filesystem browser and session writer, the effective config, pairing, the
+thumbnail and media resources — and the command stream (`POST /link`), the one
+way a `/vimix/*` command reaches Vimix.
+
+Media files are served with a correct RFC 7233 Range implementation (206 +
+Content-Range + Accept-Ranges, 416 on bad ranges, 200 full without Range), plus
+an ffprobe-backed /meta endpoint and one cached thumbnail frame per request.
+Sources are addressed by NAME through the daemon's live state table; a name that
+is not a media source (no uri) returns 404 and no path is ever opened from the
+request itself (no traversal surface).
 
 This module is deliberately free of ``import viosc``: the daemon runs as
 ``__main__`` and a by-name import would create a SECOND module copy with an
@@ -34,6 +39,11 @@ MAX_SESSION_BODY_BYTES = 262144  # POST /fs/session: a request carries up to 256
 # backlog (an overflow is a RESYNC signal, never silent loss).
 SSE_HEARTBEAT_S = 15.0
 EVENT_QUEUE_MAX = 256
+# e98s01: the command stream. One client, one connection, one frame per chunk.
+# The read timeout is what removes a dead peer: the client pings every 2 s, so
+# eight seconds of silence means the socket is gone (a half-open TCP connection
+# would otherwise hold the handler thread for ever).
+LINK_IDLE_TIMEOUT_S = 8.0
 
 
 class EventHub:
@@ -130,6 +140,7 @@ def make_preview_handler(
     regen_thumb=None,
     apply_lane=None,
     state_lock=None,
+    apply_link=None,
 ):
     """Build a handler class bound to the daemon's live state table and probe.
 
@@ -167,6 +178,11 @@ def make_preview_handler(
     ``regen_thumb`` and ``apply_lane`` are the daemon's handlers for the three POST
     routes of the same epic. Every one of them is OPTIONAL: absent, the route answers
     404, which is how a new consumer detects an older daemon.
+
+    ``apply_link`` (e98s01) is the command-stream sink: called once per chunk with
+    the raw frame bytes. The daemon owns decode, validation and logging (forward,
+    echo, session sync); this module owns only the framing, so a frame that raises
+    closes the stream and nothing is half-applied.
     """
 
     class BoundPreviewHandler(http.server.BaseHTTPRequestHandler):
@@ -217,6 +233,12 @@ def make_preview_handler(
                     self._send_unauthorized()
                     return
                 self._serve_lane()
+                return
+            if route == "/link":
+                if not self._authorized():
+                    self._send_unauthorized()
+                    return
+                self._serve_link()
                 return
             if route != "/auth" or gate is None or not gate.enabled:
                 self.send_error(404)
@@ -436,6 +458,65 @@ def make_preview_handler(
                 self._send_json(400, {"error": "invalid JSON body"})
                 return
             self._send_json(200, apply_lane(payload))
+
+        def _serve_link(self):
+            """The command stream (e98s01): chunked request body, one frame per chunk.
+
+            ``BaseHTTPRequestHandler`` does not parse a chunked *request* body, so
+            the framing is read here: the size line, the bytes, the CRLF, until the
+            zero chunk. Each frame is one JSON object handed to the daemon's
+            ``apply_link`` as raw bytes; a frame that raises closes the connection,
+            because a stream with a hole in it is worse than a reconnect.
+
+            The response is only sent when the client closes the stream properly
+            (the zero chunk): 204. A disconnect (the normal case during a restart)
+            simply ends the loop.
+            """
+            if apply_link is None:
+                self.send_error(404)
+                return
+            encoding = (self.headers.get("Transfer-Encoding") or "").lower()
+            if "chunked" not in encoding:
+                self._send_json(400, {"error": "POST /link needs Transfer-Encoding: chunked"})
+                return
+            self.connection.settimeout(LINK_IDLE_TIMEOUT_S)
+            # There is exactly one request on this connection: every exit closes it,
+            # including the early ones (a malformed frame is a disconnect).
+            self.close_connection = True
+            while True:
+                try:
+                    line = self.rfile.readline(128)
+                except OSError:
+                    return
+                if not line:
+                    return
+                try:
+                    size = int(line.strip().split(b";")[0] or b"", 16)
+                except ValueError:
+                    return
+                if size == 0:
+                    with contextlib.suppress(OSError):
+                        self.rfile.readline(128)
+                    break
+                try:
+                    body = self.rfile.read(size)
+                except OSError:
+                    return
+                if len(body) != size:
+                    return
+                try:
+                    self.rfile.read(2)
+                except OSError:
+                    return
+                try:
+                    apply_link(body)
+                except Exception:
+                    # The daemon already logged why: a broken frame ends the stream.
+                    return
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self.close_connection = True
 
         def _serve_config(self):
             """The effective config + source markers + editable set (e58s01)."""
@@ -675,7 +756,7 @@ def make_preview_handler(
     return BoundPreviewHandler
 
 
-def start_preview_server(
+def start_http_server(
     ip,
     port,
     vimix_data,
@@ -693,6 +774,7 @@ def start_preview_server(
     regen_thumb=None,
     apply_lane=None,
     state_lock=None,
+    apply_link=None,
 ):
     """Bind (and return) the preview HTTP server against the daemon's state."""
     handler = make_preview_handler(
@@ -711,6 +793,7 @@ def start_preview_server(
         regen_thumb=regen_thumb,
         apply_lane=apply_lane,
         state_lock=state_lock,
+        apply_link=apply_link,
     )
 
     class PreviewServer(socketserver.ThreadingTCPServer):

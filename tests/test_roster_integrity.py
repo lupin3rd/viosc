@@ -67,7 +67,6 @@ def _clean(monkeypatch):
         viosc.prune_timer = None
     monkeypatch.setattr(viosc, "PRUNE_DELAY_SEC", 30.0)
     monkeypatch.setattr(viosc, "request_uri_once", lambda *a, **k: None)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **k: False)
     monkeypatch.setattr(viosc, "forward_client", Recorder())
     yield
     viosc.vimix_data.clear()
@@ -160,7 +159,6 @@ def test_the_probe_rebuilds_a_lost_roster_and_prunes(monkeypatch):
         entry = viosc.create_empty_vimix_entry()
         entry["name"] = f"old{index}"
         viosc.vimix_data[index] = entry
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **k: False)
 
     assert viosc.start_roster_probe(now=100.0) is True
     handler = viosc.create_osc_handler(viosc.FROMVIMIX_PORT)

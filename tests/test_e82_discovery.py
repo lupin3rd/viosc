@@ -10,6 +10,7 @@ viOSC forwards the session commands, so it can ask right there: one immediate
 asynchronously. The forward itself stays byte-identical.
 """
 
+import json
 import os
 import sys
 
@@ -32,13 +33,11 @@ class Recorder:
 def _rig(monkeypatch):
     recorder = Recorder()
     monkeypatch.setattr(viosc, "forward_client", recorder)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **kw: False)
     # test_boot leaves the global at 500 ms: pin the cadence this suite reasons about.
     monkeypatch.setattr(viosc, "sync_interval_time", 2000)
     viosc._pending_session_sync_at = 0.0
     viosc._last_core_sync = 0.0
     viosc._state_tier_last = 0.0
-    viosc._last_monitor_poll = 0.0
     viosc._last_sync_sent = 0.0
     viosc._awaiting_roster = False
     viosc._sync_sent_at = 0.0
@@ -55,18 +54,19 @@ def _syncs(recorder):
     return [m for m in recorder.messages if m[0] == "/vimix/current/sync"]
 
 
-def _handler():
-    return viosc.create_osc_handler(viosc.LISTEN_PORT)
+def _command(address, *args):
+    """One command through the 1.0 upstream: a frame on POST /link (e98s04)."""
+    viosc.apply_link_frame(json.dumps({"address": address, "args": list(args)}).encode("utf-8"))
 
 
 def test_session_open_asks_for_the_roster_immediately(_rig):
-    _handler()(("10.0.0.2", 5), "/vimix/session/open", "/tmp/s.mix")
+    _command("/vimix/session/open", "/tmp/s.mix")
 
     assert _syncs(_rig) == [("/vimix/current/sync", [])], "the session change is the event"
 
 
 def test_the_forward_is_unchanged_and_comes_first(_rig):
-    _handler()(("10.0.0.2", 5), "/vimix/session/open", "/tmp/s.mix")
+    _command("/vimix/session/open", "/tmp/s.mix")
 
     assert _rig.messages[0] == ("/vimix/session/open", ["/tmp/s.mix"]), "verbatim, untouched"
     assert _syncs(_rig) == [("/vimix/current/sync", [])]
@@ -88,6 +88,6 @@ def test_one_retry_lands_half_a_second_later(_rig):
 
 
 def test_another_command_does_not_ask(_rig):
-    _handler()(("10.0.0.2", 5), "/vimix/clip/alpha", 0.4)
+    _command("/vimix/clip/alpha", 0.4)
 
     assert _syncs(_rig) == []

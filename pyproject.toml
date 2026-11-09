@@ -23,7 +23,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]
 [tool.mypy]
 python_version = "3.13"
 ignore_missing_imports = true
-files = ["viosc.py", "viosc_gui.py", "preview_http.py", "tests"]
+files = ["viosc.py", "viosc_gui.py", "http_api.py", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
