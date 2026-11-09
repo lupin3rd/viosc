@@ -33,7 +33,6 @@ def _clean(monkeypatch):
     viosc.state_rev = 0
     viosc.change_log.clear()
     monkeypatch.setattr(viosc, "request_source_props", lambda *a, **kw: None)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **kw: False)
     yield
     viosc.vimix_data.clear()
     viosc.known_indices.clear()
@@ -177,7 +176,9 @@ def test_the_forward_is_unchanged_and_the_echo_applies(monkeypatch):
     forward = FakeUDPClient("127.0.0.1", 7000)
     monkeypatch.setattr(viosc, "forward_client", forward)
 
-    viosc.create_osc_handler(viosc.LISTEN_PORT)(("10.0.0.2", 5), "/vimix/clip/alpha", 0.25)
+    import json
+
+    viosc.apply_link_frame(json.dumps({"address": "/vimix/clip/alpha", "args": [0.25]}).encode())
 
     assert forward.messages == [("/vimix/clip/alpha", [0.25])], "the frozen forward is untouched"
     assert viosc.vimix_data[5]["alpha"] == pytest.approx(0.25)

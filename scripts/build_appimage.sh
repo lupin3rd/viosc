@@ -13,7 +13,7 @@
 #      specs/archive/spikes/SPIKE-tkinter-in-python-appimage.md).
 #   2. --appimage-extract the base to an AppDir.
 #   3. pip install python-osc into the AppDir site-packages.
-#   4. copy viosc.py config.py logbus.py viosc_gui.py preview_http.py to
+#   4. copy viosc.py config.py logbus.py viosc_gui.py http_api.py to
 #      AppDir/opt/viosc.
 #   5. static ffmpeg+ffprobe (johnvansickle build) into AppDir/usr/bin.
 #   6. custom AppRun: PATH -> $APPDIR/usr/bin first (bundled ffmpeg wins),
@@ -110,9 +110,24 @@ echo "==> installing runtime dependencies (interpreter: $PY)"
 "$PY" -m pip install --quiet "python-osc>=1.7"
 
 echo "==> bundling viosc sources"
+# The list is explicit so a new module is a decision, not an accident. The guard
+# below is the reason: 1.0.0 shipped an AppImage without `instancelock.py` (added
+# in e98s06) and the artifact died on `import instancelock` at boot, which only
+# the smoke test noticed.
+MODULES=(
+  viosc.py config.py logbus.py viosc_gui.py http_api.py fs_api.py mix_schema.py
+  pairing.py instancelock.py
+)
 mkdir -p "$APPDIR/opt/viosc"
-for module in viosc.py config.py logbus.py viosc_gui.py preview_http.py fs_api.py mix_schema.py pairing.py; do
+for module in "${MODULES[@]}"; do
   cp "$ROOT/$module" "$APPDIR/opt/viosc/"
+done
+for source in "$ROOT"/*.py; do
+  name="$(basename "$source")"
+  if [[ " ${MODULES[*]} " != *" $name "* ]]; then
+    echo "ERROR: $name is not in MODULES above — the artifact would miss it." >&2
+    exit 1
+  fi
 done
 cp "$ROOT/THIRD_PARTY_LICENSES.md" "$APPDIR/opt/viosc/" 2>/dev/null || true
 

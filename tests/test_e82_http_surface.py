@@ -15,7 +15,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import preview_http
+import http_api
 
 
 class ServerFixture:
@@ -29,7 +29,7 @@ class ServerFixture:
         regen_thumb=None,
         apply_lane=None,
     ):
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1",
             0,
             {},
@@ -135,7 +135,7 @@ def test_interest_rejects_a_malformed_body():
 
 
 def test_events_streams_one_delta_with_its_revision():
-    hub = preview_http.EventHub()
+    hub = http_api.EventHub()
     f = ServerFixture(events=hub)
     conn, resp = f.stream()
     try:
@@ -163,8 +163,8 @@ def test_events_streams_one_delta_with_its_revision():
 
 
 def test_events_keeps_the_connection_alive_with_a_heartbeat(monkeypatch):
-    monkeypatch.setattr(preview_http, "SSE_HEARTBEAT_S", 0.05)
-    f = ServerFixture(events=preview_http.EventHub())
+    monkeypatch.setattr(http_api, "SSE_HEARTBEAT_S", 0.05)
+    f = ServerFixture(events=http_api.EventHub())
     conn, resp = f.stream()
     try:
         assert resp.readline().strip() == b": connected"
@@ -176,7 +176,7 @@ def test_events_keeps_the_connection_alive_with_a_heartbeat(monkeypatch):
 
 
 def test_the_hub_tells_a_stuck_client_to_resync():
-    hub = preview_http.EventHub(maxsize=1)
+    hub = http_api.EventHub(maxsize=1)
     channel = hub.subscribe()
     hub.publish({"rev": 1})
     hub.publish({"rev": 2})

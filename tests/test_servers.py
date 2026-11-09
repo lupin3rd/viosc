@@ -19,10 +19,10 @@ def test_start_server_instance_logs_bind_failure_not_traceback(capsys, monkeypat
 
     monkeypatch.setattr(viosc, "BlockingOSCUDPServer", busy_server)
 
-    viosc.start_server_instance("127.0.0.1", 6666)
+    viosc.start_server_instance("127.0.0.1", 7101)
 
     out = capsys.readouterr().out
-    assert "cannot bind 127.0.0.1:6666" in out
+    assert "cannot bind 127.0.0.1:7101" in out
     assert "another viOSC instance" in out
     assert "Traceback" not in out
 
@@ -56,7 +56,7 @@ def test_bind_probe_false_on_busy_port():
 
 
 def test_warn_busy_ports_emits_duplicate_hint(capsys, monkeypatch):
-    monkeypatch.setattr(viosc, "bind_probe", lambda ip, port: False)
+    monkeypatch.setattr(viosc, "bind_probe", lambda ip, port, sock_type=0: False)
 
     viosc.warn_busy_ports()
 
@@ -108,7 +108,7 @@ def test_start_server_instance_sizes_the_receive_buffer(monkeypatch):
     RecordingServer.instances = []
     monkeypatch.setattr(viosc, "BlockingOSCUDPServer", RecordingServer)
 
-    viosc.start_server_instance("0.0.0.0", 6666)
+    viosc.start_server_instance("0.0.0.0", 7101)
     viosc.start_server_instance("127.0.0.1", 7001)
 
     assert len(RecordingServer.instances) == 2

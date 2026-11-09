@@ -63,8 +63,9 @@ LOG="$(mktemp -t viosc-log)"
 PORTS="$(python3 - <<'PY'
 import socket
 socks = []
-for _ in range(4):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(2):
+    kind = socket.SOCK_DGRAM
+    sock = socket.socket(socket.AF_INET, kind)
     sock.bind(("127.0.0.1", 0))
     socks.append(sock)
 print(" ".join(str(sock.getsockname()[1]) for sock in socks))
@@ -73,21 +74,18 @@ for sock in socks:
 PY
 )"
 set -- $PORTS
-LISTEN_PORT="$1"; FROMVIMIX_PORT="$2"; PREVIEW_PORT="$3"; REPLY_PORT="$4"
-python3 - "$CFG" "$LISTEN_PORT" "$FROMVIMIX_PORT" "$PREVIEW_PORT" "$REPLY_PORT" <<'PY'
+FROMVIMIX_PORT="$1"; HTTP_PORT="$2"
+python3 - "$CFG" "$FROMVIMIX_PORT" "$HTTP_PORT" <<'PY'
 import json
 import sys
 
-path, listen, from_vimix, preview, reply = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+path, from_vimix, http_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
-            "listen_port": listen,
             "from_vimix_port": from_vimix,
-            "preview_ip": "127.0.0.1",
-            "preview_port": preview,
-            "ui_ip": "127.0.0.1",
-            "reply_port": reply,
+            "http_ip": "127.0.0.1",
+            "http_port": http_port,
             "pairing_enabled": False,
             "log_level": 1,
         },
@@ -105,7 +103,7 @@ trap cleanup EXIT
 
 status="000"
 for _ in $(seq 1 40); do
-    status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PREVIEW_PORT/state" || true)"
+    status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/state" || true)"
     [ "$status" = "200" ] && break
     sleep 0.25
 done

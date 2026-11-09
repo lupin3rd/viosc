@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import preview_http
+import http_api
 import viosc
 
 
@@ -37,7 +37,7 @@ class ThumbServerFixture:
     """A running data-plane server with the daemon's thumbnail resolver wired."""
 
     def __init__(self):
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1",
             0,
             viosc.vimix_data,

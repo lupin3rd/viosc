@@ -34,11 +34,8 @@ def _clean(monkeypatch):
         entry["name"] = name
         viosc.vimix_data[index] = entry
     viosc.interest_sources.clear()
-    viosc.monitored_sources.clear()
-    viosc.watched_sources.clear()
     viosc._state_tier_last = 0.0
     viosc._last_core_sync = 0.0
-    viosc._last_monitor_poll = 0.0
     viosc._last_sync_sent = 0.0
     viosc._pending_session_sync_at = 0.0
     viosc._awaiting_roster = False
@@ -50,7 +47,6 @@ def _clean(monkeypatch):
     monkeypatch.setattr(viosc, "forward_client", rec)
     monkeypatch.setattr(viosc, "request_source_props", lambda n, p: gets.append((n, list(p))))
     monkeypatch.setattr(viosc, "start_roster_probe", lambda *a, **k: False)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **k: False)
     monkeypatch.setattr(viosc, "request_uri_once", lambda *a, **k: None)
     yield rec, gets
     viosc.vimix_data.clear()

@@ -23,16 +23,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import preview_http
+import http_api
 import viosc
-
-
-class FakeUDPClient:
-    def __init__(self, ip, port):
-        self.messages = []
-
-    def send_message(self, address, args):
-        self.messages.append((address, list(args)))
 
 
 def seed_source(idx=0, name="clip", **props):
@@ -45,20 +37,16 @@ def seed_source(idx=0, name="clip", **props):
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
-    FakeUDPClient.sent = []
-    monkeypatch.setattr(viosc, "ui_reply_client", FakeUDPClient(viosc.UI_IP, viosc.REPLY_PORT))
-    viosc.monitored_sources.clear()
+def _clean():
     viosc.vimix_data.clear()
     viosc.source_current = None
     yield
     viosc.vimix_data.clear()
-    viosc.monitored_sources.clear()
 
 
 @pytest.fixture
 def srv():
-    server = preview_http.start_preview_server(
+    server = http_api.start_http_server(
         "127.0.0.1",
         0,
         viosc.vimix_data,
@@ -94,19 +82,21 @@ def test_state_resource_is_json(srv):
     assert json.loads(body)["sources"]["0"]["alpha"] == 0.5
 
 
-def test_state_body_is_byte_identical_to_the_broadcast(srv):
+def test_state_body_is_the_one_serializer(srv):
+    """e98s04: the broadcast is gone; the resource IS the serializer.
+
+    Before 1.0 the test compared the body to `/viosc/replydata`, because a drift
+    between the two transports was possible. There is one transport now, so the
+    contract is that the body equals `state_json()` — the same text every other
+    consumer in the daemon sees.
+    """
     host, port = srv
     seed_source(name="clip", uri="/mnt/clip.mp4", alpha=0.25)
     viosc.source_current = 0
-    viosc.monitored_sources["clip"] = ["alpha"]
 
     _status, _headers, body = _get(host, port)
 
-    viosc.broadcast_vimix_state()
-    broadcast_body = viosc.ui_reply_client.messages[-1][1][0]
-    assert body.decode("utf-8") == broadcast_body, (
-        "the resource and the broadcast must come from ONE serializer"
-    )
+    assert body.decode("utf-8") == viosc.state_json()
 
 
 def test_state_body_excludes_thumbnails(srv):
@@ -139,7 +129,7 @@ def test_state_resource_keeps_the_connection_alive(srv):
 
 
 def test_state_resource_is_404_without_a_provider():
-    server = preview_http.start_preview_server("127.0.0.1", 0, viosc.vimix_data, lambda p: None)
+    server = http_api.start_http_server("127.0.0.1", 0, viosc.vimix_data, lambda p: None)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

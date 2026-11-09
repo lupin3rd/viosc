@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -25,16 +25,15 @@ except ImportError:
 
 import config
 import fs_api
+import instancelock
 import mix_schema
 import pairing
 from logbus import bus as log_bus
 from logbus import console_listener, strip_ansi
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "0.9.1"
+APP_VERSION: str = "1.0.0"
 
-LISTEN_IP = "0.0.0.0"
-LISTEN_PORT = 6666
 LOCAL_BIND_IP = "127.0.0.1"
 FROMVIMIX_PORT = 7001
 
@@ -52,12 +51,6 @@ MAX_OSC_DATAGRAM_BYTES = 65535
 # A numeric target above this that matches no known id is an id, never an index.
 MAX_SOURCE_INDEX = 4096
 
-UI_IP = os.environ.get("VIOSC_UI_IP", "127.0.0.1")
-REPLY_PORT = 6667
-# e03s04: macOS caps one UDP datagram at net.inet.udp.maxdgram (9216) unless
-# the sender raises SO_SNDBUF; 65507 is the IPv4 maximum.
-MAX_LEGACY_UDP_PAYLOAD = 65507
-
 TOVIMIX_IP = "127.0.0.1"
 TOVIMIX_PORT = 7000
 
@@ -72,21 +65,21 @@ LOG_LEVEL = 1
 
 sync_interval_time = 2000
 
-# e82s02: THE STATE TIER — the fourteen properties VJmix reads today or will drive from
-# the geometry/correction panels, polled with ONE `get` per source every second for
-# EVERY source (no special cadence for the current one — user decision 2026-10-18).
+# e82s02: THE STATE TIER — the properties a consumer RENDERS, polled with ONE `get`
+# per source every second for EVERY source (no special cadence for the current one —
+# user decision 2026-10-18). Vimix answers one OSC message per attribute, so every
+# name here costs one message per source per second: a name earns its place only if
+# a VJmix screen reads it at 1 Hz (e99s01, specs/verifications/
+# AUDIT-viosc-osc-traffic.md — 162.5 msg/s at 10 sources, ~5 % density at rest).
 # Measured reply: 360-632 B for a 6-32-char name, always inside IP_MTU_SIZE.
 STATE_TIER_PROPS = (
-    "id",
-    "index",
+    # The addressing key: a rename must reach a tile within one tick, so the 2 s
+    # roster alone is not enough.
     "name",
     "alpha",
     "blending",
     "correction",
     "depth",
-    "position",
-    "size",
-    "angle",
     # e82s08 (user request): the transport/visibility state a tile or a lever may
     # want to show without declaring an interest for it.
     "play",
@@ -95,21 +88,32 @@ STATE_TIER_PROPS = (
     # e83: the tile's seek bar needs the position; the app dead-reckons it between
     # answers with play+speed (both above), so one get per second is enough.
     "seek",
+    # NOT here, and never without a consumer (e99s01): `position`/`size`/`angle`
+    # (the raw table is on demand, `Refresh all` sweeps them once), `id` (immutable,
+    # already in every roster bundle) and `index` (the mirror's own dict key).
 )
 STATE_TIER_INTERVAL_MS = 1000
+# e99s02: THE IDLE CADENCES. A daemon that keeps asking Vimix for every property
+# of every source while nobody is connected buys nothing: with VJmix closed the
+# 1 s tier and the 2 s roster cost 162.5 messages/s at 10 sources (measured,
+# specs of e99). When a consumer HAS been seen and then went quiet for
+# CONSUMER_IDLE_S, both stretch to this interval and the declared-interest polls
+# stop; the first consumer request restores the active cadences and forces one
+# full sweep, so nothing is stale on return.
+STATE_TIER_IDLE_INTERVAL_MS = 10_000
+CONSUMER_IDLE_S = 15.0
 # One thread, one tick: every poll below runs on its OWN deadline, so the state
 # tier (1 s) and the interest cadence (50 ms floor) fit next to the roster poll
 # (sync_interval_time) without a thread per source.
 POLL_TICK_MS = 50
-# The per-`get` reply budget: the tier is now 14 properties (measured 596-1060 B
-# for 17 properties at 6-32-char names), so 15 keeps even the tier plus a couple
-# of declared props as ONE message inside vimix's 1536-byte bundle buffer.
+# The per-`get` reply budget: the tier is 9 properties since e99s01 (measured
+# 596-1060 B for 17 properties at 6-32-char names), so 15 keeps even the tier plus
+# a handful of declared props as ONE message inside vimix's 1536-byte bundle buffer.
 INTEREST_MAX_PROPS_PER_GET = 15
-# e82s03: THE HTTP LANE. The producer stops broadcasting for LANE_TTL_S after the
-# last HTTP traffic (/state, /events, /interest, /lane): a consumer that reads over
-# TCP must not also be pushed to on UDP. It is a TTL, not a subscription, so a
-# crashed consumer falls back to the old lanes by itself.
-LANE_TTL_S = 30.0
+# The declared-interest cadence bounds (e82s03, e98s04): 50 ms is the fastest a
+# mapping needs, 60 s the slowest a wildcard sweep may ask for.
+INTEREST_MIN_INTERVAL_MS = 50
+INTEREST_MAX_INTERVAL_MS = 60000
 # e82s06: DISCOVERY ON THE EVENT. vimix answers the roster bundle only when asked,
 # and /vimix/session/open produces NO bundle at all — so viOSC asks right after it
 # has forwarded one, and once more 500 ms later because vimix loads the media
@@ -216,20 +220,9 @@ COLOR_RESET_EV = "\033[91m"
 COLOR_TIMESTAMP = "\033[90m"
 
 
-def _tune_ui_client(client: Any) -> None:
-    """Raise the legacy UDP send limit on Darwin (e03s04, best effort)."""
-    if sys.platform != "darwin":
-        return
-    sock = getattr(client, "_sock", None)
-    if sock is None:
-        return
-    with contextlib.suppress(OSError):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, MAX_LEGACY_UDP_PAYLOAD)
-
-
+# The module-level client, so an import-time read (or a test's setattr) always
+# has a target; boot() replaces it with the configured one (e98s04).
 forward_client = SimpleUDPClient(TOVIMIX_IP, TOVIMIX_PORT)
-ui_reply_client = SimpleUDPClient(UI_IP, REPLY_PORT)
-_tune_ui_client(ui_reply_client)
 
 vimix_data: dict[int, dict[str, Any]] = {}
 source_current: int | None = None
@@ -237,27 +230,15 @@ seen_indices: set[int] = set()
 sync_round = 0
 prune_timer: threading.Timer | None = None
 PRUNE_DELAY_SEC = 0.5
-# e41s01: STATE BROADCAST COALESCING. broadcast_vimix_state() used to run on
-# EVERY changed property (8 call sites), so one monitor round over N sources x
-# M properties could cost up to N*M whole-table JSON serializations, each one
-# taxing the consumer's UI (VJmix: 0.12-2.6 ms per push, SPIKE-perf). Changes
-# inside one window now collapse into a single send: the FIRST change of a burst
-# goes out immediately (leading edge, so the common single change is never
-# delayed) and the rest wait for the trailing flush, which the sync loop runs.
-# The payload is byte-identical — only the cadence changed.
-STATE_BROADCAST_WINDOW_MS = 100
 # e82s01: the mirror's revision journal. The unit is the MESSAGE python-osc
 # dispatches (one property out of a vimix bundle, or one echo) — a bundle is not
 # observable at the daemon. Bounded on purpose: the journal feeds the HTTP delta
 # stream (e82s03) and is never the source of truth (the store is).
 CHANGE_LOG_MAX = 512
-_last_state_broadcast_at = 0.0
-_state_broadcast_pending = False
 # e82s01: the revision every consumer diffs against, plus the recent changes.
 state_rev: int = 0
 change_log: deque[dict[str, Any]] = deque(maxlen=CHANGE_LOG_MAX)
 known_indices: set[int] = set()
-monitored_sources: dict[str, list[str]] = {}
 # e82s02: what a consumer DECLARED it needs, per source:
 # {name: {"props": set(), "cadence_ms": int, "last_poll": float}}. Fed by
 # POST /interest (e82s03) and by the OSC watch lane while it still lives.
@@ -272,13 +253,16 @@ interest_full: dict[str, Any] = {
     "last_poll": 0.0,
     "remaining": None,
 }
-_lane_until = 0.0
 # The SSE fan-out, installed by boot() when the HTTP server starts (e82s03);
 # record_change publishes every applied change here.
 EVENT_HUB = None
 _state_tier_last = 0.0
 _last_core_sync = 0.0
-_last_monitor_poll = 0.0
+# e99s02: presence. `_last_consumer_at` is stamped by every route only a consumer
+# calls; 0.0 means "none seen yet", which keeps the historical cadences (a daemon
+# that never saw a consumer must never be starved by this mechanism).
+_last_consumer_at = 0.0
+_tier_idle = False
 _pending_session_sync_at = 0.0
 # e03s01: roster-round tracking. `seen_current` is filled by current/<i>;
 # `seen_id` by the index-addressed <i>/id that Vimix 0.9.3 puts in the same
@@ -300,20 +284,6 @@ vimix_has_093 = False
 _first_source_at = 0.0
 # e03s02: one lock for the mirror and the registries that serialize it.
 STATE_LOCK = threading.RLock()
-# e03s04: rate-limit the macOS legacy-UDP error line.
-_legacy_udp_error_at = 0.0
-monitor_misses: dict[str, int] = {}
-MONITOR_MAX_MISSES = 3
-# e40s05: TARGETED WATCH LANE — a client asks for a few properties of one source
-# at its own cadence and receives a targeted DELTA reply
-# (/viosc/reply/<source> <prop> <value>) at its address, instead of the
-# whole-table broadcast. Additive: the monitor registry and the broadcast above
-# stay byte-identical for older clients.
-watched_sources: dict[tuple[str, str, int], dict[str, Any]] = {}
-watch_clients: dict[tuple[str, int], Any] = {}
-WATCH_MAX_ENTRIES = 32
-WATCH_MIN_INTERVAL_MS = 50
-WATCH_MAX_INTERVAL_MS = 60000
 THUMB_MAX_CONCURRENCY = 3
 thumb_semaphore = threading.BoundedSemaphore(THUMB_MAX_CONCURRENCY)
 # e10s02: up to 3 thumbs per media at distinct jittered anchors (~15/50/85 % of duration).
@@ -321,8 +291,14 @@ THUMB_MAX_COUNT = 3
 THUMB_TARGET_ANCHORS = (0.15, 0.5, 0.85)
 THUMB_JITTER = 0.05  # ±5 % of duration around each anchor
 
-PREVIEW_IP = os.environ.get("VIOSC_PREVIEW_IP", "0.0.0.0")
-PREVIEW_PORT = int(os.environ.get("VIOSC_PREVIEW_PORT", "8686"))
+HTTP_IP = os.environ.get("VIOSC_HTTP_IP", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("VIOSC_HTTP_PORT", "8686"))
+# e98s04: the HTTP listener is the ONLY surface toward VJmix, so it is no longer
+# a degradable extra. A failed bind is loud and retried on this interval; the
+# daemon never advertises itself as working without a link.
+HTTP_BIND_RETRY_S = 5.0
+_http_up = False
+http_link_error = ""
 
 # e01s02: boot() applies the GUI-managed effective config (JSON > env >
 # default) to the module state below. Import keeps these defaults so the
@@ -330,12 +306,12 @@ PREVIEW_PORT = int(os.environ.get("VIOSC_PREVIEW_PORT", "8686"))
 
 
 def _create_clients() -> None:
-    """(Re)create both OSC clients from the current destination globals."""
-    global forward_client, ui_reply_client
+    """(Re)create the Vimix client from the current destination globals (e98s04).
+
+    One OSC client left: the frozen contract. Everything toward VJmix is HTTP.
+    """
+    global forward_client
     forward_client = SimpleUDPClient(TOVIMIX_IP, TOVIMIX_PORT)
-    ui_reply_client = SimpleUDPClient(UI_IP, REPLY_PORT)
-    _tune_ui_client(ui_reply_client)
-    watch_clients.clear()  # e40s05: the watch replies follow REPLY_PORT
 
 
 def _on_pairing_code_regenerated(code: str) -> None:
@@ -366,33 +342,28 @@ def boot(values: dict[str, Any], save_path: str | None = None) -> None:
     the servers. ``save_path`` (the config file) makes a first-run pairing
     code persistent: boot generates and writes it once, then reuses it.
     """
-    global LISTEN_IP, LISTEN_PORT, LOCAL_BIND_IP, FROMVIMIX_PORT
-    global PREVIEW_IP, PREVIEW_PORT, TOVIMIX_IP, TOVIMIX_PORT
-    global UI_IP, REPLY_PORT, FFMPEG_PATH, FFPROBE_PATH
+    global LOCAL_BIND_IP, FROMVIMIX_PORT
+    global HTTP_IP, HTTP_PORT, TOVIMIX_IP, TOVIMIX_PORT
+    global FFMPEG_PATH, FFPROBE_PATH
     global LOG_LEVEL, sync_interval_time, PRUNE_DELAY_SEC
-    global MONITOR_MAX_MISSES, THUMB_MAX_CONCURRENCY, THUMB_MAX_COUNT
+    global THUMB_MAX_CONCURRENCY, THUMB_MAX_COUNT
     global PAIRING_ENABLED, PAIRING_CODE_LENGTH, PAIRING_LEASE_SECONDS
     global PAIRING_TRUSTED_PEERS, PAIRING_CODE
     global PAIRING_CODE_TTL_HOURS, PAIRING_CODE_CREATED_AT, PAIRING_SAVE_PATH
     global PEER_REGISTRY, PAIRING_GATE
     global PAIRING_LOCK_AFTER, PAIRING_LOCK_SECONDS, PAIRING_GLOBAL_LOCK_AFTER
     global FS_ROOTS, FS_SHOW_HIDDEN, FS_PAGE_SIZE, FS_SESSIONS_DIR
-    LISTEN_IP = values["listen_ip"]
-    LISTEN_PORT = values["listen_port"]
     LOCAL_BIND_IP = values["local_bind_ip"]
     FROMVIMIX_PORT = values["from_vimix_port"]
-    PREVIEW_IP = values["preview_ip"]
-    PREVIEW_PORT = values["preview_port"]
+    HTTP_IP = values["http_ip"]
+    HTTP_PORT = values["http_port"]
     TOVIMIX_IP = values["tovimix_ip"]
     TOVIMIX_PORT = values["tovimix_port"]
-    UI_IP = values["ui_ip"]
-    REPLY_PORT = values["reply_port"]
     FFMPEG_PATH = values["ffmpeg_path"]
     FFPROBE_PATH = values["ffprobe_path"]
     LOG_LEVEL = values["log_level"]
     sync_interval_time = values["sync_interval_ms"]
     PRUNE_DELAY_SEC = values["prune_delay_sec"]
-    MONITOR_MAX_MISSES = values["monitor_max_misses"]
     THUMB_MAX_CONCURRENCY = values["thumb_max_concurrency"]
     THUMB_MAX_COUNT = values["thumb_max_count"]
     PAIRING_ENABLED = values["pairing_enabled"]
@@ -485,8 +456,25 @@ def _apply_live_field(key: str, value: Any) -> None:
     """Set the daemon global for one live field and rebuild what depends on it."""
     attr = config.daemon_attr(key)
     globals()[attr] = value
-    if key in ("ui_ip", "reply_port", "tovimix_ip", "tovimix_port"):
+    if key in ("tovimix_ip", "tovimix_port"):
         _create_clients()
+
+
+def config_payload(path: str | None = None) -> dict[str, Any]:
+    """The ``GET /config`` payload (e58s01, e98s03).
+
+    The effective values, where each one came from, what a remote client may
+    edit, and — since 1.0 — the daemon's own ``app_version``: the consumer gates
+    on it before it drives anything, because a 1.0 daemon cannot announce itself
+    to a client that no longer speaks the old protocol.
+    """
+    vals, srcs, _ = config.load_effective(path or config.config_path())
+    return {
+        "values": vals,
+        "sources": srcs,
+        "editable": config.remote_editable_fields(),
+        "app_version": APP_VERSION,
+    }
 
 
 def apply_config_changes(changes: dict[str, Any], cfg_path: str | None = None) -> dict[str, Any]:
@@ -516,9 +504,10 @@ def apply_config_changes(changes: dict[str, Any], cfg_path: str | None = None) -
     }
 
 
-MEDIA_META_CACHE: dict[
-    str, dict[str, Any] | None
-] = {}  # absolute path -> probe_media_meta result (cached once)
+# absolute path -> probe_media_meta result. Bounded since e98s04: a long session
+# over many files used to grow it for ever (one entry per file ever probed).
+MEDIA_META_CACHE_MAX = 256
+MEDIA_META_CACHE: OrderedDict[str, dict[str, Any] | None] = OrderedDict()
 
 # e57s01: the third media_kind value. A source is "other" when it has no file
 # (non-media classes) or its file has no video stream at all (audio-only,
@@ -715,6 +704,7 @@ def probe_media_meta(file_path):
     if not FFMPEG_AVAILABLE:
         return None
     if file_path in MEDIA_META_CACHE:
+        MEDIA_META_CACHE.move_to_end(file_path)
         return MEDIA_META_CACHE[file_path]
     meta = None
     try:
@@ -763,6 +753,9 @@ def probe_media_meta(file_path):
     except Exception:
         meta = None
     MEDIA_META_CACHE[file_path] = meta
+    MEDIA_META_CACHE.move_to_end(file_path)
+    while len(MEDIA_META_CACHE) > MEDIA_META_CACHE_MAX:
+        MEDIA_META_CACHE.popitem(last=False)
     return meta
 
 
@@ -797,7 +790,6 @@ def _mark_media_kind_other(idx: int, reason: str) -> None:
             return
         vimix_data[idx]["media_kind"] = MEDIA_KIND_OTHER
         record_change(idx, "media_kind", MEDIA_KIND_OTHER)
-    schedule_state_broadcast()
     if LOG_LEVEL >= 1:
         log_bus.emit(f"{COLOR_THUMB}[THUMB SKIP]{COLOR_RESET} Index {idx}: {reason}; no thumbnails")
 
@@ -818,12 +810,10 @@ def publish_media_kind(idx, uri_value):
     if not os.path.exists(file_path):
         return None
     kind = classify_media_kind(file_path)
-    changed = False
     with STATE_LOCK:
         if vimix_data[idx].get("media_kind") != kind:
             vimix_data[idx]["media_kind"] = kind
             record_change(idx, "media_kind", kind)
-            changed = True
     # e83: the clip LENGTH, from the same cached probe. `seek` is a fraction of the
     # timeline, so the app's seek bar needs the duration to dead-reckon (a fraction
     # advanced by `speed` alone saturates to 100% in one second). A viOSC-local key
@@ -837,9 +827,6 @@ def publish_media_kind(idx, uri_value):
         ):
             vimix_data[idx]["duration_s"] = duration
             record_change(idx, "duration_s", duration)
-            changed = True
-    if changed:
-        schedule_state_broadcast()
     return kind
 
 
@@ -905,35 +892,14 @@ def install_event_hub(hub) -> None:
     EVENT_HUB = hub
 
 
-def note_lane_traffic(now=None) -> None:
-    """Arm the HTTP lane for LANE_TTL_S from now (e82s03)."""
-    global _lane_until
-    _lane_until = (time.time() if now is None else now) + LANE_TTL_S
-
-
-def lane_active(now=None) -> bool:
-    """True while a consumer is known to read over HTTP (e82s03)."""
-    return (time.time() if now is None else now) < _lane_until
-
-
 def http_state_json() -> str:
-    """``state_json`` for the HTTP resource, which also arms the lane (e82s03).
+    """``state_json`` for the HTTP resource (e82s04, e98s04).
 
-    Asking for the whole table is the strongest evidence that this consumer reads
-    over HTTP: there is no reason to keep pushing the same bytes at it on UDP.
+    Since 1.0 there is no lane to arm: HTTP is the only transport toward VJmix.
+    e99s02: the snapshot poll is also the clearest "a consumer is here" signal.
     """
-    note_lane_traffic()
+    note_consumer_activity()
     return state_json()
-
-
-def apply_lane(payload) -> dict[str, Any]:
-    """POST /lane: the consumer declares its lane; the answer is the TTL (e82s03)."""
-    note_lane_traffic()
-    return {
-        "lane": str(payload.get("state") or "pull+stream"),
-        "consumer": str(payload.get("consumer") or "unknown"),
-        "ttl_s": LANE_TTL_S,
-    }
 
 
 def regen_thumb_for(source) -> bool:
@@ -959,8 +925,8 @@ def apply_interest(payload) -> dict[str, Any]:
     not know) and ``released``. An unknown PROPERTY is refused, never forwarded: it
     would vanish in vimix and the consumer could never see why.
     """
+    note_consumer_activity()  # e99s02: only a consumer declares an interest
     report: dict[str, Any] = {"ok": [], "invalid": {}, "unknown": [], "released": False}
-    note_lane_traffic()
     source = str(payload.get("source") or "").strip()
     if not source:
         report["invalid"]["source"] = payload.get("source")
@@ -1044,87 +1010,16 @@ def state_payload() -> dict[str, Any]:
         }
         revision = state_rev
         current = source_current
-        monitored = dict(monitored_sources)
     return {
         "rev": revision,
         "current_source": current,
         "sources": safe_data,
-        "monitored": monitored,
     }
 
 
 def state_json() -> str:
     """The state table as the exact JSON text both transports send (e41s04)."""
     return json.dumps(state_payload())
-
-
-def _log_legacy_udp_error(error: BaseException) -> None:
-    """One rate-limited line for a legacy UDP send failure (e03s04)."""
-    global _legacy_udp_error_at
-    now = time.monotonic()
-    if now - _legacy_udp_error_at < 10.0:
-        return
-    _legacy_udp_error_at = now
-    log_bus.emit(
-        f"{COLOR_RESET_EV}[LEGACY UDP]{COLOR_RESET} send failed ({error}); "
-        "the HTTP data plane is the supported path",
-        "error",
-    )
-
-
-def broadcast_vimix_state():
-    if not _ui_allowed():
-        return
-    if lane_active():
-        return  # e82s03: a consumer reading over HTTP is not pushed to
-    try:
-        ui_reply_client.send_message("/viosc/replydata", [state_json()])
-    except OSError as e:
-        _log_legacy_udp_error(e)
-    except Exception as e:
-        log_bus.emit(f"Broadcast error: {e}", "error")
-
-
-def _ui_allowed() -> bool:
-    """True when the configured UI peer may receive replies (e42s01)."""
-    return PAIRING_GATE.is_bound(UI_IP)
-
-
-def schedule_state_broadcast(now: float | None = None) -> bool:
-    """Send the state broadcast now, or mark it pending inside the window (e41s01).
-
-    Leading edge: the first change after a quiet window goes out immediately, so
-    an isolated change (the common case) is never delayed. A change arriving
-    inside the window only sets the pending flag; ``flush_state_broadcast()``
-    delivers it. Returns True when a message went out now.
-    """
-    global _last_state_broadcast_at, _state_broadcast_pending
-    clock = time.monotonic() if now is None else now
-    if clock - _last_state_broadcast_at >= STATE_BROADCAST_WINDOW_MS / 1000.0:
-        _last_state_broadcast_at = clock
-        _state_broadcast_pending = False
-        broadcast_vimix_state()
-        return True
-    _state_broadcast_pending = True
-    return False
-
-
-def flush_state_broadcast(now: float | None = None) -> bool:
-    """Deliver the coalesced broadcast once the window has elapsed (e41s01).
-
-    Returns True when a message went out, so the caller (the sync loop) can log
-    or assert it; a second call with nothing pending is a no-op.
-    """
-    global _last_state_broadcast_at, _state_broadcast_pending
-    if not _state_broadcast_pending:
-        return False
-    clock = time.monotonic() if now is None else now
-    if clock - _last_state_broadcast_at < STATE_BROADCAST_WINDOW_MS / 1000.0:
-        return False
-    _last_state_broadcast_at = clock
-    _state_broadcast_pending = False
-    broadcast_vimix_state()
-    return True
 
 
 def start_new_sync_round():
@@ -1162,6 +1057,10 @@ def _round_is_complete() -> bool:
 def _delete_source(idx: int) -> None:
     """Remove one source and journal the removal (caller holds STATE_LOCK)."""
     record_change(idx, "source", False, kind="removed")
+    # e98s04: a declared interest dies with its source. Before the fix the poll
+    # skipped an unresolvable name for ever, so a renamed or removed source kept
+    # a live entry and a `get` per tick that could never answer.
+    interest_sources.pop(str(vimix_data[idx].get("name") or ""), None)
     del vimix_data[idx]
     known_indices.discard(idx)
     _roster_missed.pop(idx, None)
@@ -1251,7 +1150,6 @@ def probe_poll(now: float | None = None) -> int:
         log_bus.emit(
             f"{COLOR_TIMESTAMP}[ROSTER]{COLOR_RESET} probe confirmed {len(found)} source(s)"
         )
-    schedule_state_broadcast()
     return len(found)
 
 
@@ -1301,7 +1199,6 @@ def prune_stale_sources(round_id):
                 f"drop={drop}/{total}): no prune, probing"
             )
         return
-    schedule_state_broadcast()
 
 
 def resolve_thumbnail_blob(name, index):
@@ -1345,38 +1242,6 @@ def thumbnails_for(target_identifier):
     return vimix_data[idx].get("thumbnails") or None
 
 
-def send_thumbnail_blob(target_identifier, thumb_arg):
-    if not _ui_allowed():
-        return
-    idx = (
-        int(target_identifier)
-        if str(target_identifier).isdigit()
-        else find_index_by_name(str(target_identifier))
-    )
-    if idx is None or idx not in vimix_data:
-        return
-
-    thumbnails = thumbnails_for(target_identifier)
-    if not thumbnails:
-        return
-
-    arg_str = str(thumb_arg).lower().strip()
-    if arg_str == "all":
-        indices_to_send = list(range(len(thumbnails)))
-    elif arg_str.isdigit() and 0 <= int(arg_str) < len(thumbnails):
-        indices_to_send = [int(arg_str)]
-    else:
-        return
-
-    for t_idx in indices_to_send:
-        blob_data = thumbnails[t_idx]
-        osc_reply_path = f"/viosc/replythumb/{target_identifier}/{t_idx}"
-        try:
-            ui_reply_client.send_message(osc_reply_path, blob_data)
-        except OSError as e:
-            _log_legacy_udp_error(e)
-
-
 def request_source_props(target_str, props):
     try:
         forward_client.send_message(f"/vimix/{target_str}/get", list(props))
@@ -1411,130 +1276,6 @@ def vimix_idle_seconds(now: float | None = None) -> float | None:
     return clock - last_vimix_seen
 
 
-def process_dynamic_sync_request(clean_address, args):
-    target = clean_address.replace("viosc/sync/", "", 1)
-    req_args = [str(arg) for arg in args]
-    props_to_send = (
-        ALL_PROPERTIES if not req_args or "all" in [a.lower() for a in req_args] else req_args
-    )
-    request_source_props(target, props_to_send)
-
-
-def process_monitor_command(target_identifier, args):
-    name = str(target_identifier)
-    if name.isdigit():
-        cached_name = vimix_data.get(int(name), {}).get("name")
-        if cached_name is not None:
-            name = str(cached_name)
-    props = [str(a) for a in args if str(a).strip()]
-    if not props:
-        if name in monitored_sources:
-            del monitored_sources[name]
-            monitor_misses.pop(name, None)
-            if LOG_LEVEL >= 1:
-                log_bus.emit(
-                    f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} stopped monitoring: '{name}'"
-                )
-            schedule_state_broadcast()
-        return
-    monitored_sources[name] = props
-    monitor_misses.pop(name, None)
-    if LOG_LEVEL >= 1:
-        log_bus.emit(f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} monitoring '{name}' -> {props}")
-    request_source_props(name, props)
-    schedule_state_broadcast()
-
-
-def monitor_poll():
-    with STATE_LOCK:
-        entries = list(monitored_sources.items())
-    for name, props in entries:
-        if find_index_by_name(name) is None:
-            with STATE_LOCK:
-                monitor_misses[name] = monitor_misses.get(name, 0) + 1
-                missed = monitor_misses[name] >= MONITOR_MAX_MISSES
-                if missed:
-                    del monitored_sources[name]
-                    del monitor_misses[name]
-            if missed:
-                if LOG_LEVEL >= 1:
-                    log_bus.emit(
-                        f"{COLOR_TIMESTAMP}[MONITOR]{COLOR_RESET} removed: '{name}' "
-                        f"(source no longer present)"
-                    )
-                schedule_state_broadcast()
-            continue
-        with STATE_LOCK:
-            monitor_misses[name] = 0
-        request_source_props(name, props)
-
-
-def _watch_interval(token: Any) -> int | None:
-    """A legal watch cadence in ms, or None (e40s05: clamped 50..60000)."""
-    try:
-        ms = int(float(token))
-    except (TypeError, ValueError):
-        return None
-    if ms < WATCH_MIN_INTERVAL_MS:
-        return None
-    return min(ms, WATCH_MAX_INTERVAL_MS)
-
-
-def process_watch_command(client_address, target_identifier, args) -> bool:
-    """Register/replace (or drop) a targeted watch for one requester (e40s05).
-
-    `/viosc/watch/<name> <cadence_ms> <prop...>` → subscribe; without
-    arguments → unsubscribe. The requester identity is the sender IP (its listen
-    port is REPLY_PORT, the same the UI uses); the reply goes to
-    `<sender_ip>:REPLY_PORT`. Returns True when the registry changed.
-    """
-    name = str(target_identifier)
-    if name.isdigit():
-        cached_name = vimix_data.get(int(name), {}).get("name")
-        if cached_name is not None:
-            name = str(cached_name)
-    ip = str(client_address[0]) if client_address else UI_IP
-    key = (name, ip, int(REPLY_PORT))
-    tokens = [str(a) for a in args if str(a).strip()]
-    if not tokens:
-        if key in watched_sources:
-            with STATE_LOCK:
-                del watched_sources[key]
-            if LOG_LEVEL >= 1:
-                log_bus.emit(f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} stopped: '{name}' from {ip}")
-            return True
-        return False
-    interval = _watch_interval(tokens[0])
-    props = tokens[1:]
-    if interval is None or not props:
-        log_bus.emit(
-            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} ignored '{name}' from {ip}: "
-            f"need <cadence_ms {WATCH_MIN_INTERVAL_MS}..{WATCH_MAX_INTERVAL_MS}> <prop...>"
-        )
-        return False
-    with STATE_LOCK:
-        at_capacity = key not in watched_sources and len(watched_sources) >= WATCH_MAX_ENTRIES
-    if at_capacity:
-        log_bus.emit(
-            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} ignored '{name}' from {ip}: "
-            f"at capacity ({WATCH_MAX_ENTRIES})"
-        )
-        return False
-    with STATE_LOCK:
-        watched_sources[key] = {
-            "props": props,
-            "interval_ms": interval,
-            "last_poll": time.monotonic(),
-        }
-    if LOG_LEVEL >= 1:
-        log_bus.emit(
-            f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} watching '{name}' from {ip} "
-            f"every {interval} ms -> {props}"
-        )
-    request_source_props(name, props)  # immediate fast feedback, like the monitor
-    return True
-
-
 def poll_due(last, interval_ms, now) -> bool:
     """True when a poll whose last run was ``last`` is due at ``now`` (e82s02).
 
@@ -1551,7 +1292,7 @@ def _clamp_interval(cadence_ms) -> int:
         ms = int(float(cadence_ms))
     except (TypeError, ValueError):
         return STATE_TIER_INTERVAL_MS
-    return max(WATCH_MIN_INTERVAL_MS, min(ms, WATCH_MAX_INTERVAL_MS))
+    return max(INTEREST_MIN_INTERVAL_MS, min(ms, INTEREST_MAX_INTERVAL_MS))
 
 
 def set_interest(source, props, cadence_ms=STATE_TIER_INTERVAL_MS) -> bool:
@@ -1603,6 +1344,57 @@ def _chunks(props, size) -> list[list[str]]:
     return [ordered[i : i + size] for i in range(0, len(ordered), size)]
 
 
+def note_consumer_activity(now: float | None = None) -> None:
+    """Stamp that a consumer just talked (e99s02).
+
+    Called by the four routes only a consumer uses: `GET /state`, a new
+    `/events` subscriber, `POST /interest` and `POST /link`. `now` is injectable
+    for the tests, which drive the poller on a fake clock.
+    """
+    global _last_consumer_at
+    with STATE_LOCK:
+        _last_consumer_at = time.monotonic() if now is None else float(now)
+
+
+def consumer_present(now: float | None = None) -> bool:
+    """True when something is (or may be) consuming the mirror (e99s02).
+
+    Absence must be EVIDENCED: a daemon that never saw a consumer answers True,
+    so an unknown consumer cannot be starved. Idle requires all of: no `/events`
+    subscriber, a consumer seen in the past, quiet for `CONSUMER_IDLE_S`, and no
+    one-shot sweep in flight (which is a consumer's request still being served).
+    """
+    clock = time.monotonic() if now is None else float(now)
+    hub = EVENT_HUB
+    if hub is not None and hub.count() > 0:
+        return True
+    if _last_consumer_at <= 0.0:
+        return True
+    if bool(interest_full.get("active")):
+        return True
+    return clock - _last_consumer_at <= CONSUMER_IDLE_S
+
+
+def _note_presence(clock: float) -> bool:
+    """Settle the idle/active transition and return `consumer_present` (e99s02).
+
+    On the tick that sees idle -> present, the two deadlines are cleared so the
+    consumer gets ONE full tier round and ONE roster round immediately: the first
+    `/state` it reads is at most one tick old, and the sources it is about to
+    address are already in the roster.
+    """
+    global _tier_idle, _state_tier_last, _last_core_sync
+    present = consumer_present(clock)
+    with STATE_LOCK:
+        if present and _tier_idle:
+            _tier_idle = False
+            _state_tier_last = 0.0
+            _last_core_sync = 0.0
+        elif not present:
+            _tier_idle = True
+    return present
+
+
 def interest_poll(now=None) -> int:
     """One coalesced poll pass: state tier union declared interests (e82s02).
 
@@ -1612,11 +1404,15 @@ def interest_poll(now=None) -> int:
     """
     global _state_tier_last
     clock = time.monotonic() if now is None else now
+    present = _note_presence(clock)
+    tier_ms = STATE_TIER_INTERVAL_MS if present else STATE_TIER_IDLE_INTERVAL_MS
     with STATE_LOCK:
-        tier_due = poll_due(_state_tier_last, STATE_TIER_INTERVAL_MS, clock)
+        tier_due = poll_due(_state_tier_last, tier_ms, clock)
         if tier_due:
             _state_tier_last = clock
-        due_props = _interest_due_props(clock, tier_due)
+        # e99s02: an interest declared by a consumer that is no longer there has
+        # nobody to serve; the declared entries are kept, they just do not fire.
+        due_props = _interest_due_props(clock, tier_due) if present else {}
         if tier_due:
             for data in list(vimix_data.values()):
                 name = data.get("name")
@@ -1715,7 +1511,8 @@ def sync_tick(now=None) -> None:
         if _pending_session_sync_at and clock >= _pending_session_sync_at:
             _pending_session_sync_at = 0.0
             _send_sync(clock, "retry")
-        if poll_due(_last_core_sync, sync_interval_time, clock):
+        core_ms = sync_interval_time if _note_presence(clock) else STATE_TIER_IDLE_INTERVAL_MS
+        if poll_due(_last_core_sync, core_ms, clock):
             _last_core_sync = clock
             _send_sync(clock, "core")
         if _awaiting_roster and clock - _sync_sent_at >= SYNC_ROUND_TIMEOUT_S:
@@ -1727,73 +1524,9 @@ def sync_tick(now=None) -> None:
         probe_poll(clock)
     with contextlib.suppress(Exception):
         interest_poll(clock)
-    if poll_due(_last_monitor_poll, sync_interval_time, clock):
-        _last_monitor_poll = clock
-        with contextlib.suppress(Exception):
-            monitor_poll()
     with contextlib.suppress(Exception):
-        watch_poll(clock)
-    with contextlib.suppress(Exception):
-        flush_state_broadcast(clock)
+        interest_poll(clock)
     _check_vimix_compat(clock)
-
-
-def watch_poll(now: float | None = None) -> int:
-    """Poll the due watch entries, coalescing one get per source (e40s05).
-
-    Returns how many sources were polled this round. An entry whose source no
-    longer resolves is skipped (the reply simply never comes); the registry is
-    cleaned by the unsubscribe command or the entry cap.
-    """
-    now = time.monotonic() if now is None else now
-    due: dict[str, set[str]] = {}
-    with STATE_LOCK:
-        for (name, _ip, _port), entry in list(watched_sources.items()):
-            interval_s = max(1, int(entry["interval_ms"])) / 1000.0
-            if now - float(entry.get("last_poll", 0.0)) < interval_s:
-                continue
-            entry["last_poll"] = now
-            due.setdefault(name, set()).update(str(p) for p in entry["props"])
-    for name, props in due.items():
-        if find_index_by_name(name) is not None:
-            request_source_props(name, sorted(props))
-    return len(due)
-
-
-def _watch_client(ip: str) -> Any:
-    """The cached reply client of one requester IP (e40s05)."""
-    key = (str(ip), int(REPLY_PORT))
-    client = watch_clients.get(key)
-    if client is None:
-        client = SimpleUDPClient(key[0], key[1])
-        watch_clients[key] = client
-    return client
-
-
-def notify_watchers(idx: int, prop: str, value: Any) -> int:
-    """Send the targeted delta to every watcher of a source (e40s05).
-
-    Returns how many replies were sent. Only the CHANGED property is sent, only
-    to the requesters that asked for it: the fast lane stays O(watchers of that
-    prop), never a whole-table broadcast.
-    """
-    if not watched_sources:
-        return 0
-    name = vimix_data.get(idx, {}).get("name")
-    if not name:
-        return 0
-    sent = 0
-    for (watched_name, ip, _port), entry in list(watched_sources.items()):
-        if watched_name != name or prop not in entry["props"]:
-            continue
-        try:
-            _watch_client(ip).send_message(f"/viosc/reply/{name}", [prop, value])
-            sent += 1
-        except Exception as e:
-            log_bus.emit(
-                f"{COLOR_TIMESTAMP}[WATCH]{COLOR_RESET} reply to {ip} failed: {e}", "error"
-            )
-    return sent
 
 
 # e82s01: THE ECHO. A forwarded absolute `/vimix/<target>/<prop>` set is applied to
@@ -1926,6 +1659,11 @@ def process_vimix_message(address, args):
         with STATE_LOCK:
             if idx not in vimix_data:
                 vimix_data[idx] = create_empty_vimix_entry()
+                # e99s01: the dictionary key IS the live-session index (the roster
+                # addresses sources by index and `_resolve_target_index` derives the
+                # key from this same table), so the tier no longer asks Vimix for it.
+                # It keeps reaching /state and /events exactly as before.
+                vimix_data[idx]["index"] = idx
 
             if prop_name in ("id", "type") and val is not None:
                 vimix_has_093 = True
@@ -1970,9 +1708,6 @@ def process_vimix_message(address, args):
             vimix_data[idx][prop_name] = val
             if is_changed:
                 record_change(idx, prop_name, val, kind="added" if created else "changed")
-            if is_changed:
-                notify_watchers(idx, prop_name, val)  # e40s05: the targeted fast lane
-
             if is_changed and LOG_LEVEL >= 1:
                 log_bus.emit(
                     f"{COLOR_TIMESTAMP}[VIMIX DATA]{COLOR_RESET} Source {idx} | {prop_name}: {val}"
@@ -1987,6 +1722,55 @@ def process_vimix_message(address, args):
     return None
 
 
+def forward_command(address: str, args: Any) -> None:
+    """Forward one decoded command to Vimix and keep the mirror in step (e98s01).
+
+    The single forwarding path, shared by the legacy OSC input (until e98s04) and
+    the HTTP command stream: the bytes toward Vimix are produced here and nowhere
+    else, so the frozen contract cannot drift between the two entries. The echo
+    only READS the message, and its failure must never cost the command itself.
+    """
+    forward_client.send_message(address, list(args))
+    if str(address).lstrip("/") in SESSION_COMMAND_ADDRESSES:
+        request_session_sync()
+    try:
+        apply_echo(address, args)
+    except Exception as e:
+        if LOG_LEVEL >= 1:
+            log_bus.emit(f"{COLOR_RESET_EV}[ECHO]{COLOR_RESET} ignored: {e}", "error")
+
+
+def apply_link_frame(payload: bytes) -> None:
+    """Apply one raw frame from the HTTP command stream (e98s01).
+
+    Raises on anything the link must not accept: the transport closes the stream
+    on a raise, so a malformed frame costs a reconnect and never a half-applied
+    command. A ``{"ping": true}`` keepalive is not a command and is not forwarded.
+    """
+    try:
+        frame = json.loads(payload.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        log_bus.emit(f"{COLOR_RESET_EV}[LINK]{COLOR_RESET} malformed frame", "error")
+        raise ValueError("malformed frame") from None
+    if not isinstance(frame, dict):
+        log_bus.emit(f"{COLOR_RESET_EV}[LINK]{COLOR_RESET} frame is not an object", "error")
+        raise ValueError("frame is not an object")
+    note_consumer_activity()  # e99s02: a live command stream is a live consumer
+    if frame.get("ping"):
+        return
+    address = frame.get("address")
+    if not isinstance(address, str) or not address.startswith("/"):
+        log_bus.emit(f"{COLOR_RESET_EV}[LINK]{COLOR_RESET} frame has no OSC address", "error")
+        raise ValueError("frame has no OSC address")
+    args = frame.get("args")
+    if args is None:
+        args = []
+    if not isinstance(args, list):
+        log_bus.emit(f"{COLOR_RESET_EV}[LINK]{COLOR_RESET} args is not a list", "error")
+        raise ValueError("args is not a list")
+    forward_command(address, args)
+
+
 def create_osc_handler(server_port):
     def osc_handler(client_address, address, *args):
         clean_address = address.lstrip("/")
@@ -1997,70 +1781,46 @@ def create_osc_handler(server_port):
         )
 
         # e42s01: the authenticator is always accepted; every other message from
-        # an unbound peer is dropped BEFORE it can reach vimix (the forward and
-        # the /viosc/* commands alike).
+        # an unbound peer is dropped BEFORE it can reach vimix.
         if clean_address.rstrip("/") == "viosc/auth":
             code = args[0] if args else ""
             if not PAIRING_GATE.authenticate_peer(code, peer_ip) and LOG_LEVEL >= 1:
                 log_bus.emit(f"{COLOR_RESET_EV}[PAIRING]{COLOR_RESET} rejected {peer_ip}", "error")
             return
-        if not PAIRING_GATE.is_bound(peer_ip):
-            return
 
-        if clean_address.startswith("viosc/thumb/"):
-            target_identifier = clean_address.replace("viosc/thumb/", "", 1)
-            thumb_arg = args[0] if args else "all"
-            send_thumbnail_blob(target_identifier, thumb_arg)
-        elif clean_address.startswith("viosc/regen_thumb/"):
-            target_identifier = clean_address.replace("viosc/regen_thumb/", "", 1)
-            idx = (
-                int(target_identifier)
-                if target_identifier.isdigit()
-                else find_index_by_name(target_identifier)
-            )
-            if idx is not None and idx in vimix_data:
-                uri_val = vimix_data[idx].get("uri")
-                if uri_val and vimix_data[idx].get("media_kind") != MEDIA_KIND_OTHER:
-                    # e10s01: do NOT wipe the cache before regenerating — the
-                    # worker replaces it only on success, so a failed regen keeps
-                    # the previous good thumbnail. (e57s01: an "other" source has
-                    # nothing to regenerate and is skipped.)
-                    threading.Thread(
-                        target=generate_thumbnails_worker, args=(idx, uri_val), daemon=True
-                    ).start()
-        elif clean_address.startswith("viosc/sync/"):
-            process_dynamic_sync_request(clean_address, args)
-        elif clean_address.startswith("viosc/monitor/"):
-            target_name = clean_address.replace("viosc/monitor/", "", 1)
-            process_monitor_command(target_name, args)
-        elif clean_address.startswith("viosc/watch/"):
-            target_name = clean_address.replace("viosc/watch/", "", 1)
-            process_watch_command(client_address, target_name, args)
-        elif clean_address.startswith("viosc"):
-            pass
+        if clean_address.startswith("viosc"):
+            # BUG-2026-11-08: the gate covers the CONTROLLER lane only. It used to
+            # sit above every branch, so Vimix's own replies (the local OSC
+            # upstream, no pairing to give) were dropped until a controller
+            # happened to authenticate from the same IP — the mirror stayed empty
+            # while VJmix was not connected.
+            if not PAIRING_GATE.is_bound(peer_ip):
+                return
+            if clean_address.startswith("viosc/regen_thumb/"):
+                target_identifier = clean_address.replace("viosc/regen_thumb/", "", 1)
+                idx = (
+                    int(target_identifier)
+                    if target_identifier.isdigit()
+                    else find_index_by_name(target_identifier)
+                )
+                if idx is not None and idx in vimix_data:
+                    uri_val = vimix_data[idx].get("uri")
+                    if uri_val and vimix_data[idx].get("media_kind") != MEDIA_KIND_OTHER:
+                        # e10s01: do NOT wipe the cache before regenerating — the
+                        # worker replaces it only on success, so a failed regen keeps
+                        # the previous good thumbnail. (e57s01: an "other" source has
+                        # nothing to regenerate and is skipped.)
+                        threading.Thread(
+                            target=generate_thumbnails_worker, args=(idx, uri_val), daemon=True
+                        ).start()
         elif server_port == FROMVIMIX_PORT and clean_address.startswith("vimix/"):
             mark_vimix_activity()
             if clean_address.startswith("vimix/current/"):
-                is_valid, idx, is_changed = process_vimix_current_message(address, args)
-                if is_valid and is_changed:
-                    schedule_state_broadcast()
+                # The change is recorded by the ingest (record_change) and reaches
+                # VJmix on /events: there is no broadcast to schedule any more.
+                process_vimix_current_message(address, args)
             else:
-                parsed = process_vimix_message(address, args)
-                if parsed:
-                    _, _, _, is_changed = parsed
-                    if is_changed:
-                        schedule_state_broadcast()
-        elif server_port == LISTEN_PORT:
-            forward_client.send_message(address, list(args))
-            if str(address).lstrip("/") in SESSION_COMMAND_ADDRESSES:
-                request_session_sync()
-            # e82s01: the forward is already done (byte-identical); the echo only
-            # READS the message, and a failure must never cost the command itself.
-            try:
-                apply_echo(address, args)
-            except Exception as e:
-                if LOG_LEVEL >= 1:
-                    log_bus.emit(f"{COLOR_RESET_EV}[ECHO]{COLOR_RESET} ignored: {e}", "error")
+                process_vimix_message(address, args)
 
     return osc_handler
 
@@ -2073,9 +1833,14 @@ def sync_loop():
         time.sleep(POLL_TICK_MS / 1000.0)
 
 
-def bind_probe(ip: str, port: int) -> bool:
-    """True when a UDP socket can bind (ip, port) right now."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+def bind_probe(ip: str, port: int, sock_type: int = socket.SOCK_DGRAM) -> bool:
+    """True when a socket of ``sock_type`` can bind (ip, port) right now.
+
+    The OSC endpoints are UDP and the HTTP surface is TCP; probing the wrong
+    family always succeeds (separate port spaces), which is how a second instance
+    kept looking healthy (e98s04).
+    """
+    sock = socket.socket(socket.AF_INET, sock_type)
     try:
         sock.bind((ip, port))
         return True
@@ -2093,12 +1858,15 @@ def warn_busy_ports() -> None:
     threads or a bind race later.
     """
     busy = []
-    for role, ip, port in (
-        ("input", LISTEN_IP, LISTEN_PORT),
-        ("vimix replies", LOCAL_BIND_IP, FROMVIMIX_PORT),
-    ):
+    for role, ip, port in (("vimix replies", LOCAL_BIND_IP, FROMVIMIX_PORT),):
         if not bind_probe(ip, port):
             busy.append(f"{role} {ip}:{port}")
+    # e98s04: the HTTP surface is the link. A second instance loses this bind and
+    # serves nobody, so say it at boot (before the retry loop starts) instead of
+    # letting a window with a pairing code pretend it is usable.
+    http_ip = "127.0.0.1" if HTTP_IP in ("0.0.0.0", "") else HTTP_IP
+    if not bind_probe(http_ip, HTTP_PORT, socket.SOCK_STREAM):
+        busy.append(f"HTTP {HTTP_IP}:{HTTP_PORT} (another viOSC owns the link)")
     for item in busy:
         log_bus.emit(
             f"{COLOR_RESET_EV}[STARTUP]{COLOR_RESET} port busy ({item}) — is "
@@ -2217,9 +1985,9 @@ def restart_command() -> list[str]:
     return [sys.executable, os.path.realpath(sys.argv[0]), *sys.argv[1:]]
 
 
-def _report_gui_fatal() -> None:
-    """GUI-mode fatal-boot dialog (console is off): show the log tail."""
-    detail = "\n".join(strip_ansi(text) for text, _level in log_bus.tail(count=25))
+def _report_gui_fatal(headline: str | None = None) -> None:
+    """GUI-mode fatal-boot dialog (console is off): show ``headline`` or the log tail."""
+    detail = headline or "\n".join(strip_ansi(text) for text, _level in log_bus.tail(count=25))
     try:
         import tkinter as tk
         from tkinter import messagebox
@@ -2300,6 +2068,53 @@ class _FsAccess:
         )
 
 
+def http_link_status() -> str:
+    """``up`` / ``starting`` / the bind error — the window's link row (e98s04)."""
+    if _http_up:
+        return "up"
+    return http_link_error or "starting"
+
+
+def start_http_forever(make_server, retry_s: float = HTTP_BIND_RETRY_S) -> None:
+    """Bind the only surface, retrying loudly and for ever (e98s04).
+
+    Before 1.0 a busy ``:8686`` was a degraded preview while the OSC lanes kept
+    the link alive. There is no second path now: a daemon that cannot bind must
+    say so every ``retry_s`` and must never look healthy. ``make_server`` returns
+    a bound server (it raises ``OSError`` on a busy port).
+    """
+    global _http_up, http_link_error
+    while True:
+        try:
+            server = make_server()
+        except OSError as e:
+            _http_up = False
+            http_link_error = f"cannot bind {HTTP_IP}:{HTTP_PORT} ({e})"
+            log_bus.emit(
+                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} {http_link_error} — "
+                f"retrying in {int(retry_s)} s",
+                "error",
+            )
+            time.sleep(retry_s)
+            continue
+        except Exception as e:
+            _http_up = False
+            http_link_error = str(e)
+            log_bus.emit(
+                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} {http_link_error} — "
+                f"retrying in {int(retry_s)} s",
+                "error",
+            )
+            time.sleep(retry_s)
+            continue
+        _http_up = True
+        http_link_error = ""
+        if LOG_LEVEL >= 1:
+            log_bus.emit(f"[HTTP] listening on {HTTP_IP}:{HTTP_PORT}")
+        server.serve_forever()
+        return
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="viosc", description="viOSC OSC router/state mirror for Vimix"
@@ -2319,20 +2134,34 @@ def main():
     gui_mode = not args.headless
     if not gui_mode:
         log_bus.subscribe(console_listener, replay=True)
+    # e98s08: ONE daemon per machine. The lock is taken before anything is bound
+    # or loaded, so a second launch cannot fight for the ports or show a pairing
+    # code it could never serve.
+    lock = instancelock.InstanceLock(instancelock.lock_path(args.config or config.config_path()))
+    if not lock.acquire():
+        holder = lock.holder()
+        message = (
+            "viOSC is already running"
+            + (f" (pid {holder})" if holder else "")
+            + " — one instance per machine. Close the other window first."
+        )
+        log_bus.emit(f"{COLOR_RESET_EV}[STARTUP]{COLOR_RESET} {message}", "error")
+        if gui_mode:
+            _report_gui_fatal(message)
+        else:
+            print(f"ERROR: {message}", file=sys.stderr)
+        sys.exit(2)
     values, _sources = load_boot_config(args.config)
     verify_dependencies()
     log_bus.emit(
         "=========================================================================================="
     )
     log_bus.emit(
-        "                      MULTI-PORT OSC ROUTER 'viOSC' STARTED                           "
+        "            viOSC STARTED — OSC toward Vimix, HTTP toward the controller            "
     )
-    log_bus.emit(
-        f"   input   : {LISTEN_IP}:{LISTEN_PORT}   (commands -> vimix {TOVIMIX_IP}:{TOVIMIX_PORT})"
-    )
-    log_bus.emit(f"   from vimix: {LOCAL_BIND_IP}:{FROMVIMIX_PORT}   (vimix default OSC replies)")
-    log_bus.emit(f"   output  : {UI_IP}:{REPLY_PORT}   (state / thumbnails / monitor for the UI)")
-    log_bus.emit(f"   preview : {PREVIEW_IP}:{PREVIEW_PORT}   (HTTP file/meta transport, e38s01)")
+    log_bus.emit(f"   vimix out : {TOVIMIX_IP}:{TOVIMIX_PORT}   (commands; OSC only toward Vimix)")
+    log_bus.emit(f"   vimix in  : {LOCAL_BIND_IP}:{FROMVIMIX_PORT}   (vimix default OSC replies)")
+    log_bus.emit(f"   http      : {HTTP_IP}:{HTTP_PORT}   (state/events/commands/files)")
     if PAIRING_ENABLED:
         log_bus.emit(f"   pairing : code {PAIRING_CODE}   (pairing ON — enter this code in the UI)")
     log_bus.emit(
@@ -2342,19 +2171,11 @@ def main():
     threading.Thread(target=sync_loop, daemon=True).start()
 
     threading.Thread(
-        target=start_server_instance, args=(LISTEN_IP, LISTEN_PORT), daemon=True
-    ).start()
-    threading.Thread(
         target=start_server_instance, args=(LOCAL_BIND_IP, FROMVIMIX_PORT), daemon=True
     ).start()
 
     def _config_provider():
-        vals, srcs, _ = config.load_effective(args.config or config.config_path())
-        return {
-            "values": vals,
-            "sources": srcs,
-            "editable": config.remote_editable_fields(),
-        }
+        return config_payload(args.config or config.config_path())
 
     def _apply_config(changes):
         return apply_config_changes(changes, args.config or config.config_path())
@@ -2362,17 +2183,19 @@ def main():
     def _restart():
         os.execv(sys.executable, restart_command())
 
-    # e38s01: the HTTP preview surface is a separate daemon; a busy/missing
-    # port degrades preview only — the OSC role keeps running. The server is
-    # bound to THIS module's live state table and probe (the module runs as
-    # __main__ — an import-by-name inside the server would see an empty copy).
-    try:
-        from preview_http import EventHub, start_preview_server
+    # e98s04: the HTTP surface is the link. It binds in its own thread so a busy
+    # port cannot stop the window from opening and showing WHY the link is down.
+    # The server is bound to THIS module's live state table and probe (the module
+    # runs as __main__ — an import-by-name inside the server would see an empty
+    # copy).
+    from http_api import EventHub, start_http_server
 
-        install_event_hub(EventHub(on_subscribe=note_lane_traffic))
-        preview_server = start_preview_server(
-            PREVIEW_IP,
-            PREVIEW_PORT,
+    install_event_hub(EventHub(on_subscribe=note_consumer_activity))  # e99s02
+
+    def _make_http_server():
+        return start_http_server(
+            HTTP_IP,
+            HTTP_PORT,
             vimix_data,
             probe_media_meta,
             resolve_thumbnail_blob,
@@ -2386,24 +2209,11 @@ def main():
             events=EVENT_HUB,
             apply_interest=apply_interest,
             regen_thumb=regen_thumb_for,
-            apply_lane=apply_lane,
             state_lock=STATE_LOCK,
+            apply_link=apply_link_frame,
         )
-        threading.Thread(target=preview_server.serve_forever, daemon=True).start()
-        if LOG_LEVEL >= 1:
-            log_bus.emit(f"[PREVIEW] HTTP server listening on {PREVIEW_IP}:{PREVIEW_PORT}")
-    except OSError as e:
-        log_bus.emit(
-            f"{COLOR_RESET_EV}[PREVIEW ERROR]{COLOR_RESET} cannot bind {PREVIEW_IP}:{PREVIEW_PORT} "
-            f"({e}) — preview degraded, OSC role continues",
-            "error",
-        )
-    except Exception as e:
-        log_bus.emit(
-            f"{COLOR_RESET_EV}[PREVIEW ERROR]{COLOR_RESET} {e} — "
-            f"preview degraded, OSC role continues",
-            "error",
-        )
+
+    threading.Thread(target=start_http_forever, args=(_make_http_server,), daemon=True).start()
 
     if gui_mode:
         try:

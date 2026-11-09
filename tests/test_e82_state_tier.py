@@ -2,7 +2,7 @@
 
 Every property vimix does not push is known only because somebody polls it, and the
 old policy was scattered per subscriber: `watch_poll` issued one `get` per
-(source, requester) at that entry's cadence, while the ten properties the app
+(source, requester) at that entry's cadence, while the properties the app
 actually reads were never asked for at all.
 
 This suite pins the new shape: ONE loop ticks every `POLL_TICK_MS`, each task runs
@@ -40,7 +40,6 @@ def _rig(monkeypatch):
     viosc.interest_sources.clear()
     viosc._state_tier_last = 0.0
     viosc._last_core_sync = 0.0
-    viosc._last_monitor_poll = 0.0
     viosc._last_sync_sent = 0.0
     viosc._awaiting_roster = False
     viosc._sync_sent_at = 0.0
@@ -48,7 +47,6 @@ def _rig(monkeypatch):
     viosc._probe_last_at = 0.0
     monkeypatch.setattr(viosc, "sync_interval_time", 2000)
     monkeypatch.setattr(viosc, "start_roster_probe", lambda *a, **k: False)
-    monkeypatch.setattr(viosc, "schedule_state_broadcast", lambda *a, **kw: False)
     rec = Recorder()
     monkeypatch.setattr(viosc, "forward_client", rec)
     viosc.vimix_data[1] = viosc.create_empty_vimix_entry()
@@ -70,7 +68,7 @@ def test_the_tier_polls_every_source_once_per_second(_rig):
 
     gets = _gets(_rig)
     assert [address for address, _props in gets] == ["/vimix/clipA/get", "/vimix/clipB/get"]
-    assert set(gets[0][1]) == TIER, "the ten state properties, nothing more"
+    assert set(gets[0][1]) == TIER, "the tier's properties, nothing more"
 
 
 def test_the_tier_does_not_poll_again_inside_the_second(_rig):

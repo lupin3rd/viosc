@@ -16,8 +16,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import http_api
 import pairing
-import preview_http
 import viosc
 
 
@@ -32,7 +32,7 @@ def _effective_provider():
 
 class ConfigServerFixture:
     def __init__(self, *, gate=None, apply_config=None, restart=None):
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1",
             0,
             {},
@@ -132,10 +132,10 @@ def test_config_post_applies_a_live_field():
 def test_config_post_reports_invalid_and_unknown():
     f = ConfigServerFixture(gate=None, apply_config=viosc.apply_config_changes)
     try:
-        status, _headers, body = f.post("/config", {"listen_port": 0, "bogus": 1})
+        status, _headers, body = f.post("/config", {"from_vimix_port": 0, "bogus": 1})
         assert status == 400
         payload = json.loads(body)
-        assert "listen_port" in payload["invalid"]
+        assert "from_vimix_port" in payload["invalid"]
         assert "bogus" in payload["unknown"]
     finally:
         f.close()
@@ -144,12 +144,12 @@ def test_config_post_reports_invalid_and_unknown():
 def test_config_post_stages_restart_fields():
     f = ConfigServerFixture(gate=None, apply_config=viosc.apply_config_changes)
     try:
-        before = viosc.LISTEN_PORT
-        status, _headers, body = f.post("/config", {"listen_port": 7000})
+        before = viosc.FROMVIMIX_PORT
+        status, _headers, body = f.post("/config", {"from_vimix_port": 7005})
         assert status == 200
         payload = json.loads(body)
-        assert "listen_port" in payload["staged"]
-        assert before == viosc.LISTEN_PORT, "restart fields apply on /restart, not now"
+        assert "from_vimix_port" in payload["staged"]
+        assert before == viosc.FROMVIMIX_PORT, "restart fields apply on /restart, not now"
     finally:
         f.close()
 
@@ -180,10 +180,10 @@ def test_config_restart_requires_auth_and_calls_restart():
 def test_config_post_rejects_local_only_bind():
     f = ConfigServerFixture(gate=None, apply_config=viosc.apply_config_changes)
     try:
-        status, _headers, body = f.post("/config", {"preview_port": 9999})
+        status, _headers, body = f.post("/config", {"http_port": 9999})
         assert status == 400
         payload = json.loads(body)
-        assert "preview_port" in payload["local_only"]
+        assert "http_port" in payload["local_only"]
     finally:
         f.close()
 

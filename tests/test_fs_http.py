@@ -20,9 +20,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fs_api
+import http_api
 import mix_schema
 import pairing
-import preview_http
 
 BODY = b"0123456789abcdef" * 32  # 512 bytes, for Range tests
 
@@ -63,7 +63,7 @@ class FsServerFixture:
         (tmp_path / "pic.png").write_bytes(b"png")
         (tmp_path / "readme.txt").write_bytes(b"txt")
         self.fake_fs = FakeFs(tmp_path) if fs else None
-        self.httpd = preview_http.start_preview_server(
+        self.httpd = http_api.start_http_server(
             "127.0.0.1",
             0,
             {},
