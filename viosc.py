@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import errno
 import json
 import os
 import random
@@ -32,7 +33,7 @@ from logbus import bus as log_bus
 from logbus import console_listener, strip_ansi
 
 # Single version source for releases; the AppImage build script reads this.
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = "1.0.1"
 
 LOCAL_BIND_IP = "127.0.0.1"
 FROMVIMIX_PORT = 7001
@@ -147,15 +148,13 @@ VIMIX_COMPAT_TIMEOUT_S = 5.0
 SESSION_COMMAND_ADDRESSES = ("vimix/session/open", "vimix/session/version")
 
 
-# e42s01: LINK PAIRING. With pairing enabled (the default) a peer must present
-# the code shown at start before its OSC input (including the /vimix forward) or
-# its :8686 HTTP requests are accepted. The code lives in memory only and
-# expires after PAIRING_CODE_TTL_HOURS (BUG-2026-10-18: it used to live for ever);
-# PAIRING_TRUSTED_PEERS bypasses pairing for known hosts.
-PAIRING_ENABLED = True
+# e42s01: LINK PAIRING. A peer must present the code shown at start before its
+# :8686 HTTP requests are accepted. The code expires after PAIRING_CODE_TTL_HOURS
+# (BUG-2026-10-18: it used to live for ever). Pairing is ALWAYS on (operator
+# decision 2026-11-14): no config key disables it and there is no trusted-peer
+# bypass.
 PAIRING_CODE_LENGTH = 4
 PAIRING_LEASE_SECONDS = 3600
-PAIRING_TRUSTED_PEERS: list[str] = []
 PAIRING_CODE = ""
 # The code's lifetime and when the live one was generated. The config file is the
 # authority across restarts (pairing_code_created_at).
@@ -171,10 +170,10 @@ FS_ROOTS: list[str] = ["~"]
 FS_SHOW_HIDDEN = False
 FS_PAGE_SIZE = 500
 FS_SESSIONS_DIR = "~/vimix-sessions"
-PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS, PAIRING_TRUSTED_PEERS)
-PAIRING_GATE = pairing.PairingGate(
-    False, "", PEER_REGISTRY, PAIRING_LEASE_SECONDS
-)  # import default keeps the pre-e42 behaviour; boot() arms the real gate
+PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS)
+# Safe placeholder before boot: no code, nothing accepted. boot() arms the real,
+# always-enabled gate.
+PAIRING_GATE = pairing.PairingGate(False, "", PEER_REGISTRY, PAIRING_LEASE_SECONDS)
 
 ALL_PROPERTIES = [
     "index",
@@ -324,7 +323,7 @@ def _on_pairing_code_regenerated(code: str) -> None:
     global PAIRING_CODE, PAIRING_CODE_CREATED_AT
     PAIRING_CODE = code
     PAIRING_CODE_CREATED_AT = time.time()
-    if PAIRING_SAVE_PATH and PAIRING_ENABLED:
+    if PAIRING_SAVE_PATH:
         with contextlib.suppress(OSError):
             config.save_pairing_code(PAIRING_SAVE_PATH, code, PAIRING_CODE_CREATED_AT)
     log_bus.emit(
@@ -345,13 +344,10 @@ def boot(values: dict[str, Any], save_path: str | None = None) -> None:
     global LOCAL_BIND_IP, FROMVIMIX_PORT
     global HTTP_IP, HTTP_PORT, TOVIMIX_IP, TOVIMIX_PORT
     global FFMPEG_PATH, FFPROBE_PATH
-    global LOG_LEVEL, sync_interval_time, PRUNE_DELAY_SEC
-    global THUMB_MAX_CONCURRENCY, THUMB_MAX_COUNT
-    global PAIRING_ENABLED, PAIRING_CODE_LENGTH, PAIRING_LEASE_SECONDS
-    global PAIRING_TRUSTED_PEERS, PAIRING_CODE
+    global sync_interval_time, THUMB_MAX_COUNT
+    global PAIRING_CODE_LENGTH, PAIRING_CODE
     global PAIRING_CODE_TTL_HOURS, PAIRING_CODE_CREATED_AT, PAIRING_SAVE_PATH
     global PEER_REGISTRY, PAIRING_GATE
-    global PAIRING_LOCK_AFTER, PAIRING_LOCK_SECONDS, PAIRING_GLOBAL_LOCK_AFTER
     global FS_ROOTS, FS_SHOW_HIDDEN, FS_PAGE_SIZE, FS_SESSIONS_DIR
     LOCAL_BIND_IP = values["local_bind_ip"]
     FROMVIMIX_PORT = values["from_vimix_port"]
@@ -361,44 +357,31 @@ def boot(values: dict[str, Any], save_path: str | None = None) -> None:
     TOVIMIX_PORT = values["tovimix_port"]
     FFMPEG_PATH = values["ffmpeg_path"]
     FFPROBE_PATH = values["ffprobe_path"]
-    LOG_LEVEL = values["log_level"]
     sync_interval_time = values["sync_interval_ms"]
-    PRUNE_DELAY_SEC = values["prune_delay_sec"]
-    THUMB_MAX_CONCURRENCY = values["thumb_max_concurrency"]
     THUMB_MAX_COUNT = values["thumb_max_count"]
-    PAIRING_ENABLED = values["pairing_enabled"]
     PAIRING_CODE_LENGTH = values["pairing_code_length"]
-    PAIRING_LEASE_SECONDS = values["pairing_lease_seconds"]
-    PAIRING_TRUSTED_PEERS = list(values["pairing_trusted_peers"])
     PAIRING_SAVE_PATH = save_path or ""
-    if PAIRING_ENABLED:
-        PAIRING_CODE_TTL_HOURS = int(values.get("pairing_code_ttl_hours") or 24)
-        stored = values.get("pairing_code", "")
-        stored_at = float(values.get("pairing_code_created_at") or 0.0)
-        now = time.time()
-        code = pairing.persisted_code_if_valid(stored, PAIRING_CODE_LENGTH)
-        if code is not None and not pairing.code_is_fresh(stored_at, PAIRING_CODE_TTL_HOURS, now):
-            code = None  # BUG-2026-10-18: an expired (or un-stamped) code is never reused
-        if code is None:
-            code = pairing.generate_code(PAIRING_CODE_LENGTH)
-            stored_at = now
-            if save_path is not None:
-                config.save_pairing_code(save_path, code, stored_at)
-        PAIRING_CODE = code
-        PAIRING_CODE_CREATED_AT = stored_at
-    else:
-        PAIRING_CODE = ""
-        PAIRING_CODE_CREATED_AT = 0.0
-    PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS, PAIRING_TRUSTED_PEERS)
-    PAIRING_LOCK_AFTER = values["pairing_lock_after"]
-    PAIRING_LOCK_SECONDS = values["pairing_lock_seconds"]
-    PAIRING_GLOBAL_LOCK_AFTER = values["pairing_global_lock_after"]
+    PAIRING_CODE_TTL_HOURS = int(values.get("pairing_code_ttl_hours") or 24)
+    stored = values.get("pairing_code", "")
+    stored_at = float(values.get("pairing_code_created_at") or 0.0)
+    now = time.time()
+    code = pairing.persisted_code_if_valid(stored, PAIRING_CODE_LENGTH)
+    if code is not None and not pairing.code_is_fresh(stored_at, PAIRING_CODE_TTL_HOURS, now):
+        code = None  # BUG-2026-10-18: an expired (or un-stamped) code is never reused
+    if code is None:
+        code = pairing.generate_code(PAIRING_CODE_LENGTH)
+        stored_at = now
+        if save_path is not None:
+            config.save_pairing_code(save_path, code, stored_at)
+    PAIRING_CODE = code
+    PAIRING_CODE_CREATED_AT = stored_at
+    PEER_REGISTRY = pairing.PeerRegistry(PAIRING_LEASE_SECONDS)
     FS_ROOTS = list(values["fs_roots"])
     FS_SHOW_HIDDEN = values["fs_show_hidden"]
     FS_PAGE_SIZE = values["fs_page_size"]
     FS_SESSIONS_DIR = values["fs_sessions_dir"]
     PAIRING_GATE = pairing.PairingGate(
-        PAIRING_ENABLED,
+        True,
         PAIRING_CODE,
         PEER_REGISTRY,
         PAIRING_LEASE_SECONDS,
@@ -435,14 +418,9 @@ def rotate_pairing_code(save_path: str | None = None) -> str:
 
     The operator asks for a new code; the daemon generates it, persists it (so
     a restart keeps it) and updates the gate so the displayed code is the one
-    authentication accepts. With pairing disabled it clears the code and is a
-    no-op for persistence.
+    authentication accepts.
     """
     global PAIRING_CODE, PAIRING_CODE_CREATED_AT
-    if not PAIRING_ENABLED:
-        PAIRING_CODE = ""
-        PAIRING_CODE_CREATED_AT = 0.0
-        return ""
     code = pairing.generate_code(PAIRING_CODE_LENGTH)
     PAIRING_CODE = code
     PAIRING_CODE_CREATED_AT = time.time()
@@ -2033,6 +2011,10 @@ class _FsAccess:
     def resolve_file(self, path: str) -> str | None:
         return fs_api.resolve_file(path, FS_ROOTS)
 
+    def scan(self, path: str, recursive: bool) -> tuple[dict[str, Any] | None, str | None]:
+        """The video files of a folder tree, bounded (e100s01)."""
+        return fs_api.scan_videos(path, FS_ROOTS, recursive=recursive, show_hidden=FS_SHOW_HIDDEN)
+
     def thumb(self, path: str) -> bytes | None:
         """The cached JPEG of a media file inside the roots, else None (e43s03)."""
         target = fs_api.resolve_file(path, FS_ROOTS)
@@ -2042,9 +2024,19 @@ class _FsAccess:
             return None
         return FS_THUMB_CACHE.get(target)
 
-    def sessions(self) -> list[dict[str, Any]]:
-        """The written Session Drafts on disk (e43s06)."""
-        return mix_schema.list_sessions(os.path.expanduser(FS_SESSIONS_DIR))
+    def sessions(self, directory: str = "") -> tuple[list[dict[str, Any]] | None, str | None]:
+        """The written sessions on disk (e43s06), possibly in another folder.
+
+        ``directory`` (e100s01) selects a Media Roots folder (validated with the
+        same containment as the browser); empty keeps the configured sessions
+        directory. Each entry carries its recipe sidecar, or ``None``.
+        """
+        if not directory:
+            return mix_schema.list_sessions(os.path.expanduser(FS_SESSIONS_DIR)), None
+        real, error = fs_api.resolve_directory(directory, FS_ROOTS)
+        if real is None:
+            return None, error
+        return mix_schema.list_sessions(real), None
 
     def write_session(
         self,
@@ -2053,19 +2045,42 @@ class _FsAccess:
         *,
         overwrite: bool = False,
         alphas: dict[str, float] | None = None,
+        directory: str = "",
+        recipe: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        """Write a `.mix` draft into the configured sessions directory (e43s06).
+        """Write a `.mix` draft into the sessions directory or a chosen folder.
 
         ``overwrite`` (e44s02) replaces the exact named file instead of suffixing;
-        ``alphas`` (e45s01) encodes each source's output alpha.
+        ``alphas`` (e45s01) encodes each source's output alpha; ``directory``
+        (e100s01) writes inside a Media Roots folder and ``recipe`` stores the
+        wizard's choices beside it.
         """
+        target = os.path.expanduser(FS_SESSIONS_DIR)
+        if directory:
+            real, error = fs_api.resolve_directory(directory, FS_ROOTS)
+            if real is None:
+                return None, error
+            target = real
         return mix_schema.write_session(
-            os.path.expanduser(FS_SESSIONS_DIR),
+            target,
             name,
             files,
             overwrite=overwrite,
             alphas=alphas,
+            recipe=recipe,
         )
+
+
+def bind_error_text(error: OSError, ip: str, port: int) -> str:
+    """Short, UI-sized reason for a failed bind (the log keeps the OSError).
+
+    The window header has one line: a full ``cannot bind 0.0.0.0:8686
+    ([Errno 98] Address already in use)`` is clipped, so the status carries the
+    essence and the log carries the detail (operator, 2026-11-14).
+    """
+    if getattr(error, "errno", None) == errno.EADDRINUSE:
+        return f"port {port} in use"
+    return f"bind {ip}:{port} failed"
 
 
 def http_link_status() -> str:
@@ -2089,20 +2104,19 @@ def start_http_forever(make_server, retry_s: float = HTTP_BIND_RETRY_S) -> None:
             server = make_server()
         except OSError as e:
             _http_up = False
-            http_link_error = f"cannot bind {HTTP_IP}:{HTTP_PORT} ({e})"
+            http_link_error = bind_error_text(e, HTTP_IP, HTTP_PORT)
             log_bus.emit(
-                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} {http_link_error} — "
-                f"retrying in {int(retry_s)} s",
+                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} cannot bind "
+                f"{HTTP_IP}:{HTTP_PORT} ({e}) — {http_link_error}; retrying in {int(retry_s)} s",
                 "error",
             )
             time.sleep(retry_s)
             continue
         except Exception as e:
             _http_up = False
-            http_link_error = str(e)
+            http_link_error = "HTTP start failed"
             log_bus.emit(
-                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} {http_link_error} — "
-                f"retrying in {int(retry_s)} s",
+                f"{COLOR_RESET_EV}[HTTP ERROR]{COLOR_RESET} {e!r} — retrying in {int(retry_s)} s",
                 "error",
             )
             time.sleep(retry_s)
@@ -2162,8 +2176,9 @@ def main():
     log_bus.emit(f"   vimix out : {TOVIMIX_IP}:{TOVIMIX_PORT}   (commands; OSC only toward Vimix)")
     log_bus.emit(f"   vimix in  : {LOCAL_BIND_IP}:{FROMVIMIX_PORT}   (vimix default OSC replies)")
     log_bus.emit(f"   http      : {HTTP_IP}:{HTTP_PORT}   (state/events/commands/files)")
-    if PAIRING_ENABLED:
-        log_bus.emit(f"   pairing : code {PAIRING_CODE}   (pairing ON — enter this code in the UI)")
+    log_bus.emit(
+        f"   pairing : code {PAIRING_CODE}   (pairing always ON — enter this code in the UI)"
+    )
     log_bus.emit(
         "=========================================================================================="
     )

@@ -39,9 +39,9 @@ CONFIG_POLL_MS = 2000
 LOG_QUEUE_MAX = 500
 GUI_LOG_MAX_LINES = 2000
 FORM_COLUMNS = 2
-SNAPSHOT_HEIGHT = 4
-SNAPSHOT_NOTE = "Everything else is configured from VJmix (Settings > viOSC)."
-HEADER_WRAP = 600  # the pairing line and the HTTP-down reason share the header row
+SNAPSHOT_HEIGHT = 4  # the minimum: the columns grow to show every effective field
+SNAPSHOT_NOTE = "Read-only: change these from VJmix (Settings > viOSC)."
+HEADER_WRAP = 380  # the pairing line and the HTTP-down reason share the header row
 WINDOW_SIZE = (680, 560)
 MINSIZE = (560, 260)  # the compact window is ~282 px tall: do not floor it higher
 LOG_TITLE = "Log"
@@ -71,8 +71,7 @@ def pairing_banner(code: str, link: str) -> tuple[str, str]:
     if link == "up":
         return (f"Pairing code: {code}", "#0050a0")
     return (
-        f"HTTP surface DOWN ({link}) — pairing is impossible from this window.\n"
-        "Another viOSC is probably running: close it and restart.",
+        f"HTTP DOWN — {link}.\nClose the other viOSC, then restart.",
         "#c00000",
     )
 
@@ -100,28 +99,36 @@ def fitted_height(requested: int, remembered: int, is_open: bool) -> int:
     return max(requested, remembered) if is_open else requested
 
 
-SNAPSHOT_ROWS: tuple[tuple[str, str], ...] = (
-    ("http_port", "HTTP"),
-    ("from_vimix_port", "Vimix in"),
-    ("tovimix_port", "Vimix out"),
-    ("sync_interval_ms", "Roster poll"),
-    ("thumb_max_count", "Thumbs"),
-    ("log_level", "Log level"),
-)
+# Persisted STATE, not configuration: the pairing code is a secret already shown
+# in the header (and deliberately hidden there while the HTTP surface is down),
+# and the creation timestamp is an implementation detail. The read-only snapshot
+# shows settings only (BUG-2026-11-14T210000 follow-up, operator 2026-11-14).
+SNAPSHOT_STATE_KEYS = frozenset({"pairing_code", "pairing_code_created_at"})
 
 
 def snapshot_rows(values: dict[str, Any], sources: dict[str, str], link: str = "") -> list[str]:
-    """The six rows an operator actually reads, plus the link state (e98s06).
+    """Every effective config value, marking ONLY an env-var override.
 
-    Everything else is configured from VJmix over `GET/POST /config`; the window
-    is a viewer with two editable fields, so a raw key dump was noise. The source
-    marker (json/env/default) stays: it explains where a value came from.
+    The operator asked for the WHOLE current configuration in this read-only
+    section, not a curated six-row summary: the daemon window is where they check
+    what viOSC is actually running (fs roots, pairing, timing, hidden fields
+    included). Schema order first, then any key the running config carries that
+    this build does not know yet. Persisted state (the pairing secret and its
+    timestamp) is not a setting and is not a row.
+
+    ``(json)``/``(default)`` on every row was pure noise (operator, 2026-11-14):
+    once VJmix saves a field, the file IS the source. The one marker that still
+    matters is an environment variable silently winning over the file.
     """
-    rows = [
-        f"{label}: {config.format_field(key, values[key])} ({sources.get(key, 'default')})"
-        for key, label in SNAPSHOT_ROWS
-        if key in values
-    ]
+    keys = [key for key in config.FIELD_SPEC if key in values]
+    keys += [key for key in values if key not in config.FIELD_SPEC]
+    keys = [key for key in keys if key not in SNAPSHOT_STATE_KEYS]
+    rows = []
+    for key in keys:
+        line = f"{_pretty_name(key)}: {config.format_field(key, values[key])}"
+        if sources.get(key) == "env":
+            line += " (env)"
+        rows.append(line)
     if link:
         rows.append(f"Link: {link}")
     return rows
@@ -198,21 +205,20 @@ class VioscWindow:
                 side="left", padx=(6, 0), pady=(2, 0)
             )
 
-        self.pairing_label = None
-        if getattr(self.daemon, "PAIRING_ENABLED", False):
-            # Operator, 2026-11-08: ONE line — the version and the code together,
-            # the code flush right (the version is static, the code is what the
-            # operator reads and retypes).
-            self.pairing_var = tk.StringVar()
-            self.pairing_label = ttk.Label(
-                header,
-                textvariable=self.pairing_var,
-                font=PAIRING_FONT_UP,
-                justify="right",
-                wraplength=HEADER_WRAP,
-            )
-            self.pairing_label.pack(side="right", padx=(16, 0), pady=(2, 0))
-            self._refresh_pairing()
+        # Pairing is ALWAYS on (operator decision 2026-11-14): the header always
+        # carries the code (or why it cannot be used). ONE line — the version and
+        # the code together, the code flush right (the version is static, the code
+        # is what the operator reads and retypes).
+        self.pairing_var = tk.StringVar()
+        self.pairing_label = ttk.Label(
+            header,
+            textvariable=self.pairing_var,
+            font=PAIRING_FONT_UP,
+            justify="right",
+            wraplength=HEADER_WRAP,
+        )
+        self.pairing_label.pack(side="right", padx=(16, 0), pady=(2, 0))
+        self._refresh_pairing()
 
         self._build_bind(outer)
         self._build_snapshot(outer)
@@ -278,6 +284,8 @@ class VioscWindow:
             values, sources, link=getattr(self.daemon, "http_link_status", lambda: "")()
         )
         for text, chunk in zip(self.snapshot_texts, split_columns(rows), strict=True):
+            # Every effective field is visible: the column grows to its chunk.
+            text.configure(height=max(SNAPSHOT_HEIGHT, len(chunk)))
             text.configure(state="normal")
             text.delete("1.0", "end")
             text.insert("1.0", "\n".join(chunk))
@@ -457,6 +465,7 @@ class VioscWindow:
             values, sources, _ = config.load_effective(self.cfg_path)
             self.base_values = values
             self._set_snapshot(values, sources)
+            self._fit_window()
         self.root.after(CONFIG_POLL_MS, self.poll_config)
 
     def on_close(self) -> None:

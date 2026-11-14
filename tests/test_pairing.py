@@ -19,12 +19,8 @@ import config
 import pairing
 import viosc
 
-PAIRING_KEYS = (
-    "pairing_enabled",
-    "pairing_code_length",
-    "pairing_lease_seconds",
-    "pairing_trusted_peers",
-)
+# 2026-11-14: pairing is always on; only the code length is still a setting.
+PAIRING_KEYS = ("pairing_code_length",)
 
 
 class FakeClient:
@@ -51,10 +47,17 @@ def make_values(**overrides):
 
 
 def test_pairing_defaults_are_safe():
-    assert config.DEFAULTS["pairing_enabled"] is True
     assert config.DEFAULTS["pairing_code_length"] == 4
-    assert config.DEFAULTS["pairing_lease_seconds"] == 3600
-    assert config.DEFAULTS["pairing_trusted_peers"] == []
+    # Pairing is always on and the policy is fixed: no keys to weaken it.
+    for retired in (
+        "pairing_enabled",
+        "pairing_lease_seconds",
+        "pairing_trusted_peers",
+        "pairing_lock_after",
+        "pairing_lock_seconds",
+        "pairing_global_lock_after",
+    ):
+        assert retired not in config.DEFAULTS
 
 
 def test_pairing_keys_are_declared_with_attributes():
@@ -64,42 +67,40 @@ def test_pairing_keys_are_declared_with_attributes():
 
 
 def test_bool_validation():
-    assert config.is_valid_value("pairing_enabled", True)
-    assert config.is_valid_value("pairing_enabled", False)
-    assert not config.is_valid_value("pairing_enabled", 1)
-    assert not config.is_valid_value("pairing_enabled", "true")
+    assert config.is_valid_value("fs_show_hidden", True)
+    assert config.is_valid_value("fs_show_hidden", False)
+    assert not config.is_valid_value("fs_show_hidden", 1)
+    assert not config.is_valid_value("fs_show_hidden", "true")
 
 
 def test_bool_coercion_from_form_strings():
-    values, problems = config.parse_form({"pairing_enabled": "false"})
-    assert values["pairing_enabled"] is False
+    values, problems = config.parse_form({"fs_show_hidden": "false"})
+    assert values["fs_show_hidden"] is False
     assert problems == []
-    values, problems = config.parse_form({"pairing_enabled": "true"})
-    assert values["pairing_enabled"] is True
+    values, problems = config.parse_form({"fs_show_hidden": "true"})
+    assert values["fs_show_hidden"] is True
     assert problems == []
 
 
 def test_list_validation():
-    assert config.is_valid_value("pairing_trusted_peers", [])
-    assert config.is_valid_value("pairing_trusted_peers", ["10.0.0.5", "192.168.1.9"])
-    assert not config.is_valid_value("pairing_trusted_peers", "")
-    assert not config.is_valid_value("pairing_trusted_peers", ["", "10.0.0.5"])
-    assert not config.is_valid_value("pairing_trusted_peers", [123])
+    assert config.is_valid_value("fs_roots", [])
+    assert config.is_valid_value("fs_roots", ["/media", "~/videos"])
+    assert not config.is_valid_value("fs_roots", "")
+    assert not config.is_valid_value("fs_roots", ["", "/media"])
+    assert not config.is_valid_value("fs_roots", [123])
 
 
 def test_list_coercion_from_comma_separated_form_string():
-    values, problems = config.parse_form({"pairing_trusted_peers": "10.0.0.5, 192.168.1.9"})
-    assert values["pairing_trusted_peers"] == ["10.0.0.5", "192.168.1.9"]
+    values, problems = config.parse_form({"fs_roots": "/media, ~/videos"})
+    assert values["fs_roots"] == ["/media", "~/videos"]
     assert problems == []
 
 
 def test_effective_accepts_pairing_json_and_reports_the_source():
-    values, sources, warnings = config.effective(
-        {"pairing_enabled": False, "pairing_trusted_peers": ["10.0.0.5"]}
-    )
-    assert values["pairing_enabled"] is False
-    assert values["pairing_trusted_peers"] == ["10.0.0.5"]
-    assert sources["pairing_enabled"] == "json"
+    values, sources, warnings = config.effective({"pairing_code_length": 6, "fs_roots": ["/media"]})
+    assert values["pairing_code_length"] == 6
+    assert values["fs_roots"] == ["/media"]
+    assert sources["pairing_code_length"] == "json"
     assert warnings == []
 
 
@@ -128,32 +129,26 @@ def test_generate_code_rotates():
 
 def test_boot_generates_a_code_with_the_configured_length(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
-    values = make_values(pairing_enabled=True, pairing_code_length=6)
+    values = make_values(pairing_code_length=6)
     viosc.boot(values)
     assert len(viosc.PAIRING_CODE) == 6
     assert viosc.PAIRING_CODE.isdigit()
 
 
-def test_boot_with_pairing_disabled_has_no_code(monkeypatch):
+def test_boot_always_arms_an_enabled_gate(monkeypatch):
+    """Pairing is always on: there is no key that turns it off."""
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
-    values = make_values(pairing_enabled=False)
-    viosc.boot(values)
-    assert viosc.PAIRING_CODE == ""
+    viosc.boot(make_values())
+    assert viosc.PAIRING_GATE.enabled is True
+    assert viosc.PAIRING_CODE.isdigit()
 
 
-def test_boot_applies_the_pairing_config_to_the_daemon_state(monkeypatch):
+def test_boot_applies_the_pairing_length_to_the_daemon_state(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
-    values = make_values(
-        pairing_enabled=True,
-        pairing_code_length=5,
-        pairing_lease_seconds=120,
-        pairing_trusted_peers=["10.0.0.5"],
-    )
+    values = make_values(pairing_code_length=5)
     viosc.boot(values)
-    assert viosc.PAIRING_ENABLED is True
     assert viosc.PAIRING_CODE_LENGTH == 5
-    assert viosc.PAIRING_LEASE_SECONDS == 120
-    assert viosc.PAIRING_TRUSTED_PEERS == ["10.0.0.5"]
+    assert viosc.PAIRING_LEASE_SECONDS == 3600, "fixed policy, not config"
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +206,11 @@ def test_registry_unbind_and_sweep_drop_entries():
     assert registry.bound_count() == 0
 
 
-def test_boot_creates_the_peer_registry(monkeypatch):
+def test_boot_creates_an_empty_peer_registry(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
-    values = make_values(pairing_trusted_peers=["10.0.0.5"], pairing_lease_seconds=30)
-    viosc.boot(values)
-    assert viosc.PEER_REGISTRY.is_bound("10.0.0.5") is True
-    assert viosc.PEER_REGISTRY.is_bound("10.0.0.6") is False
+    viosc.boot(make_values())
+    assert viosc.PEER_REGISTRY.is_bound("10.0.0.5") is False
+    assert viosc.PEER_REGISTRY.bound_count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +221,7 @@ def test_boot_creates_the_peer_registry(monkeypatch):
 def test_pairing_code_persists_across_boot(monkeypatch, tmp_path):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
     cfg_path = tmp_path / "config.json"
-    viosc.boot(
-        make_values(pairing_enabled=True, pairing_code_length=4),
-        save_path=str(cfg_path),
-    )
+    viosc.boot(make_values(pairing_code_length=4), save_path=str(cfg_path))
     first = viosc.PAIRING_CODE
     assert first.isdigit() and len(first) == 4
     loaded = json.loads(cfg_path.read_text())
@@ -252,20 +243,18 @@ def test_pairing_code_reuses_a_valid_persisted_code(monkeypatch, tmp_path):
     assert viosc.PAIRING_CODE == "1234"
 
 
-def test_pairing_code_empty_when_disabled_with_save(monkeypatch, tmp_path):
+def test_pairing_code_always_persists_on_first_boot(monkeypatch, tmp_path):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
     cfg_path = tmp_path / "config.json"
-    viosc.boot(make_values(pairing_enabled=False), save_path=str(cfg_path))
-    assert viosc.PAIRING_CODE == ""
+    viosc.boot(make_values(), save_path=str(cfg_path))
+    assert viosc.PAIRING_CODE.isdigit()
+    assert json.loads(cfg_path.read_text())["pairing_code"] == viosc.PAIRING_CODE
 
 
 def test_rotate_pairing_code_regenerates_and_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
     cfg_path = tmp_path / "config.json"
-    viosc.boot(
-        make_values(pairing_enabled=True, pairing_code_length=4),
-        save_path=str(cfg_path),
-    )
+    viosc.boot(make_values(pairing_code_length=4), save_path=str(cfg_path))
     first = viosc.PAIRING_CODE
     new = viosc.rotate_pairing_code(str(cfg_path))
     assert new != first

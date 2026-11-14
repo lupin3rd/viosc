@@ -11,6 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import config
 import viosc_gui
 
 
@@ -26,21 +27,36 @@ def test_format_idle_renders_durations():
     assert viosc_gui._format_idle(0) == "0s ago"
 
 
-def test_render_snapshot_includes_values_and_sources():
+def test_render_snapshot_shows_values_and_flags_only_env_overrides():
     values = {"from_vimix_port": 7001, "ffmpeg_path": "ffmpeg", "http_port": 8686}
-    sources = {
-        "from_vimix_port": "default",
-        "ffmpeg_path": "default",
-        "http_port": "default",
-    }
+    sources = {"from_vimix_port": "default", "ffmpeg_path": "env", "http_port": "json"}
     text = viosc_gui.render_snapshot(values, sources)
-    assert "Vimix in: 7001" in text
-    assert "HTTP: 8686" in text
-    assert "default" in text
-    # e98s06: six labelled rows, not a 24-key dump — a key outside the rows and
-    # outside the effective values is not rendered, and neither is the noise.
-    assert "ffmpeg_path" not in text
-    assert "Everything else is configured from VJmix" in text
+    assert "from vimix port: 7001" in text
+    assert "http port: 8686" in text
+    # BUG-2026-11-14T210000: every effective value is readable, hidden ones too.
+    assert "ffmpeg path: ffmpeg (env)" in text
+    # Operator, 2026-11-14: the normal source needs no badge on every row.
+    assert "(json)" not in text
+    assert "(default)" not in text
+    assert viosc_gui.SNAPSHOT_NOTE in text
+
+
+def test_snapshot_rows_show_every_config_field_but_not_the_state():
+    values = dict(config.DEFAULTS)
+    rows = viosc_gui.snapshot_rows(values, {})
+    for key in config.FIELD_SPEC:
+        if key in viosc_gui.SNAPSHOT_STATE_KEYS:
+            continue
+        label = viosc_gui._pretty_name(key)
+        assert any(row.startswith(f"{label}:") for row in rows), key
+    for key in viosc_gui.SNAPSHOT_STATE_KEYS:
+        label = viosc_gui._pretty_name(key)
+        assert not any(row.startswith(f"{label}:") for row in rows), key
+
+
+def test_snapshot_rows_include_a_key_outside_the_schema():
+    rows = viosc_gui.snapshot_rows({"future_knob": 1}, {})
+    assert any(row.startswith("future knob: 1") for row in rows)
 
 
 def test_dashboard_exposes_run_gui_and_window():
@@ -80,10 +96,12 @@ def test_the_pairing_code_is_hidden_when_the_http_surface_is_down():
     text, colour = viosc_gui.pairing_banner("1234", "up")
     assert "1234" in text and colour == "#0050a0"
 
-    text, colour = viosc_gui.pairing_banner("1234", "cannot bind 0.0.0.0:8686 ([Errno 98])")
+    text, colour = viosc_gui.pairing_banner("1234", "port 8686 in use")
     assert "1234" not in text, "a code nobody can pair with must not be displayed"
-    assert "pairing is impossible" in text
+    assert "port 8686 in use" in text
+    assert "Close the other viOSC" in text
     assert colour == "#c00000"
+    assert len(text.splitlines()[0]) <= 48, "the header must not clip the reason"
 
 
 def test_snapshot_rows_are_split_in_two_columns():

@@ -5,10 +5,10 @@ beside Vimix on the same machine, speaks Vimix's OSC API, and serves everything
 VJmix needs over HTTP on one port. On its own it does nothing: VJmix is what
 drives it.
 
-**viOSC 1.0.0 requires VJmix 1.3.0 and Vimix 0.9.3+.** Linux: AppImage
+**viOSC 1.0.1 pairs with VJmix 1.3.1 and requires Vimix 0.9.3+.** Linux: AppImage
 (x86_64/aarch64) or source. macOS: x86_64/arm64 DMG.
-[Release assets](https://github.com/lupin3rd/viosc/releases/tag/v1.0.0) ·
-[Release notes](RELEASE_NOTES_1.0.0.md).
+[Release assets](https://github.com/lupin3rd/viosc/releases/tag/v1.0.1) ·
+[Release notes](RELEASE_NOTES_1.0.1.md).
 
 ## What it does
 
@@ -28,18 +28,18 @@ The result is one link: HTTP toward VJmix, OSC only toward Vimix.
 
 ### Linux (AppImage)
 
-Download `viosc-1.0.0-x86_64.AppImage` (Intel/AMD) or
-`viosc-1.0.0-aarch64.AppImage` (arm64) from the release, then:
+Download `viosc-1.0.1-x86_64.AppImage` (Intel/AMD) or
+`viosc-1.0.1-aarch64.AppImage` (arm64) from the release, then:
 
 ```bash
-chmod +x viosc-1.0.0-<arch>.AppImage
-./viosc-1.0.0-<arch>.AppImage            # GUI
-./viosc-1.0.0-<arch>.AppImage --headless # console daemon
+chmod +x viosc-1.0.1-<arch>.AppImage
+./viosc-1.0.1-<arch>.AppImage            # GUI
+./viosc-1.0.1-<arch>.AppImage --headless # console daemon
 ```
 
 ### macOS
 
-Download `viOSC-1.0.0-x86_64.dmg` or `viOSC-1.0.0-arm64.dmg`.
+Download `viOSC-1.0.1-x86_64.dmg` or `viOSC-1.0.1-arm64.dmg`.
 
 - x86_64 runs on Intel and on Apple Silicon via Rosetta 2.
 - Both architectures are built and smoke-tested natively in CI on macOS 15.
@@ -109,12 +109,12 @@ always one window, never a hidden copy fighting for port 8686.
 
 ## Pairing
 
-viOSC shows a 4-digit code at start. With `pairing_enabled` (the default) a peer
-must present it over HTTP `POST /auth` before it can drive Vimix or read the
-link. The code expires after `pairing_code_ttl_hours` (24 h), survives a
-restart, and rotates after abuse. Pairing is a shared-code gate over plaintext
-traffic, **not encryption**: restrict the port at the network level if you need
-more.
+viOSC shows a 4-digit code at start. Pairing is **always on** (there is no
+config key to disable it and no trusted-peer bypass): a peer must present the
+code over HTTP `POST /auth` before it can drive Vimix or read the link. The code
+expires after `pairing_code_ttl_hours` (24 h), survives a restart, and rotates
+after abuse. Pairing is a shared-code gate over plaintext traffic, **not
+encryption**: restrict the port at the network level if you need more.
 
 ## Configuration
 
@@ -128,9 +128,14 @@ default**. Editable from the viOSC window or from VJmix over HTTP.
 | `http_ip` / `http_port` | `0.0.0.0` / `8686` | The whole HTTP surface |
 | `ffmpeg_path` / `ffprobe_path` | `ffmpeg` / `ffprobe` | Resolved from PATH, Homebrew/MacPorts and the bundle |
 | `sync_interval_ms` | `2000` | Roster cadence; the state tier is 1 s |
-| `pairing_enabled` | `true` | See above |
+| `pairing_code_length` | `4` | Code length; changing it rotates the persisted code |
+| `pairing_code_ttl_hours` | `24` | How long a persisted code stays valid |
 
-Every other field is documented in `config.py` and shown in the window.
+Editable from VJmix: `sync_interval_ms`, `thumb_max_count`,
+`pairing_code_length`, `pairing_code_ttl_hours`, `fs_roots`, `fs_show_hidden`,
+`fs_sessions_dir`. The pairing lock/lease policy and the internal timing knobs
+are fixed constants, not settings. Every field is documented in `config.py` and
+shown in the window.
 
 ## How the mirror stays fresh
 

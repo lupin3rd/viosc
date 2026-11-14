@@ -46,12 +46,28 @@ class FakeFs:
     def thumb(self, path):
         return self.blob
 
-    def sessions(self):
-        return mix_schema.list_sessions(self.root + "_sessions")
+    def scan(self, path, recursive):
+        return fs_api.scan_videos(path, [self.root], recursive=recursive)
 
-    def write_session(self, name, files, *, overwrite=False, alphas=None):
+    def sessions(self, directory=""):
+        if directory:
+            real, error = fs_api.resolve_directory(directory, [self.root])
+            if real is None:
+                return None, error
+            return mix_schema.list_sessions(real), None
+        return mix_schema.list_sessions(self.root + "_sessions"), None
+
+    def write_session(
+        self, name, files, *, overwrite=False, alphas=None, directory="", recipe=None
+    ):
+        target = self.root + "_sessions"
+        if directory:
+            real, error = fs_api.resolve_directory(directory, [self.root])
+            if real is None:
+                return None, error
+            target = real
         return mix_schema.write_session(
-            self.root + "_sessions", name, files, overwrite=overwrite, alphas=alphas
+            target, name, files, overwrite=overwrite, alphas=alphas, recipe=recipe
         )
 
 

@@ -53,37 +53,18 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
     "tovimix_port": {"group": "live", "type": "port", "default": 7000, "attr": "TOVIMIX_PORT"},
     "ffmpeg_path": {"group": "live", "type": "path", "default": "ffmpeg", "attr": "FFMPEG_PATH"},
     "ffprobe_path": {"group": "live", "type": "path", "default": "ffprobe", "attr": "FFPROBE_PATH"},
-    "log_level": {"group": "live", "type": "level", "default": 1, "attr": "LOG_LEVEL"},
     "sync_interval_ms": {
         "group": "live",
         "type": "ms",
         "default": 2000,
         "attr": "sync_interval_time",
     },
-    "prune_delay_sec": {
-        "group": "live",
-        "type": "seconds",
-        "default": 0.5,
-        "attr": "PRUNE_DELAY_SEC",
-    },
     "thumb_max_count": {"group": "live", "type": "count", "default": 3, "attr": "THUMB_MAX_COUNT"},
-    # Group C — restart required (semaphore bound at boot)
-    "thumb_max_concurrency": {
-        "group": "boot",
-        "type": "count",
-        "default": 3,
-        "attr": "THUMB_MAX_CONCURRENCY",
-    },
-    # e42s01: link pairing (default ON). The code is generated at every start;
-    # trusted peers bypass pairing (the escape for third-party OSC clients).
-    "pairing_enabled": {
-        "group": "live",
-        "type": "bool",
-        "default": True,
-        "attr": "PAIRING_ENABLED",
-    },
+    # e42s01: link pairing is ALWAYS on. The code length and its TTL are the
+    # only pairing settings left; both are boot-time (a length change invalidates
+    # the persisted code, so the report stages it for a restart).
     "pairing_code_length": {
-        "group": "live",
+        "group": "boot",
         "type": "count",
         "default": 4,
         "attr": "PAIRING_CODE_LENGTH",
@@ -96,37 +77,6 @@ FIELD_SPEC: dict[str, dict[str, Any]] = {
         "type": "count",
         "default": 24,
         "attr": "PAIRING_CODE_TTL_HOURS",
-    },
-    "pairing_lease_seconds": {
-        "group": "live",
-        "type": "seconds",
-        "default": 3600,
-        "attr": "PAIRING_LEASE_SECONDS",
-    },
-    "pairing_trusted_peers": {
-        "group": "live",
-        "type": "list",
-        "default": [],
-        "attr": "PAIRING_TRUSTED_PEERS",
-    },
-    # e42s03: abuse resistance (a 4-digit code is brute-forced without limits).
-    "pairing_lock_after": {
-        "group": "live",
-        "type": "count",
-        "default": 5,
-        "attr": "PAIRING_LOCK_AFTER",
-    },
-    "pairing_lock_seconds": {
-        "group": "live",
-        "type": "seconds",
-        "default": 60,
-        "attr": "PAIRING_LOCK_SECONDS",
-    },
-    "pairing_global_lock_after": {
-        "group": "live",
-        "type": "count",
-        "default": 20,
-        "attr": "PAIRING_GLOBAL_LOCK_AFTER",
     },
     # e58s01: the persisted pairing code (generated once, rotated manually).
     # Empty is the "not yet generated" sentinel; boot() resolves it.
@@ -186,6 +136,18 @@ RETIRED_FIELDS: dict[str, str] = {
     "ui_ip": "nothing is pushed to VJmix (GET /events)",
     "reply_port": "nothing is pushed to VJmix (GET /events)",
     "monitor_max_misses": "the legacy monitor lane is gone",
+    # 2026-11-14 (operator decision): pairing is always on and the internal
+    # knobs are fixed policy, not settings. The keys are dropped silently; an
+    # old config.json is cleaned on the next write (merge_save).
+    "pairing_enabled": "pairing is always on",
+    "pairing_trusted_peers": "every peer pairs; no third-party OSC clients since 1.0",
+    "pairing_lease_seconds": "fixed security policy (3600 s)",
+    "pairing_lock_after": "fixed security policy (5)",
+    "pairing_lock_seconds": "fixed security policy (60 s)",
+    "pairing_global_lock_after": "fixed security policy (20)",
+    "log_level": "fixed at info; the window filters the log",
+    "prune_delay_sec": "fixed internal timing (0.5 s)",
+    "thumb_max_concurrency": "fixed at 3",
 }
 # Same for the env override names, which predate the rename.
 ENV_LEGACY_ALIASES: dict[str, str] = {
@@ -207,18 +169,9 @@ VISIBILITY: dict[str, str] = {
     "tovimix_port": "hidden",
     "ffmpeg_path": "hidden",
     "ffprobe_path": "hidden",
-    "log_level": "hidden",
     "sync_interval_ms": "advanced",
-    "prune_delay_sec": "hidden",
     "thumb_max_count": "advanced",
-    "thumb_max_concurrency": "hidden",
-    "pairing_enabled": "essential",
     "pairing_code_length": "advanced",
-    "pairing_lease_seconds": "hidden",
-    "pairing_trusted_peers": "advanced",
-    "pairing_lock_after": "hidden",
-    "pairing_lock_seconds": "hidden",
-    "pairing_global_lock_after": "hidden",
     "pairing_code": "hidden",
     "pairing_code_ttl_hours": "advanced",
     "pairing_code_created_at": "hidden",

@@ -13,6 +13,7 @@ Pure, daemon-free, stdlib only. The embedded template IS the rig-validated sourc
 element, so the writer never depends on a vimix written file at runtime.
 """
 
+import json
 import math
 import os
 import random
@@ -321,6 +322,18 @@ SESSION_EXT = ".mix"
 MAX_SESSION_NAME = 64
 _UNSAFE_FILENAME = re.compile(r"[^A-Za-z0-9 _-]+")
 
+# e100s01: the session recipe (the wizard's choices) lives BESIDE the `.mix`, as
+# `<name>.vjmix.json`. The daemon stores it opaquely: the semantics belong to
+# VJmix, which is the only writer and the only reader that acts on it.
+RECIPE_EXT = ".vjmix.json"
+MAX_RECIPE_BYTES = 16384
+
+
+def _safe_stem(name: str) -> str:
+    """The safe file stem shared by the `.mix` and its recipe sidecar."""
+    base = _UNSAFE_FILENAME.sub("_", str(name or "")).strip(" _")
+    return base[:MAX_SESSION_NAME]
+
 
 def safe_session_filename(name: str) -> str:
     """A safe ``<name>.mix`` filename, or ``""`` when nothing usable remains.
@@ -328,10 +341,14 @@ def safe_session_filename(name: str) -> str:
     Separators and anything exotic collapse to ``_``, so a request can never
     escape the sessions directory, and the extension is always ours.
     """
-    base = _UNSAFE_FILENAME.sub("_", str(name or "")).strip(" _")
-    if not base:
-        return ""
-    return f"{base[:MAX_SESSION_NAME]}{SESSION_EXT}"
+    base = _safe_stem(name)
+    return f"{base}{SESSION_EXT}" if base else ""
+
+
+def safe_recipe_filename(name: str) -> str:
+    """The sidecar filename for a session name, or ``""`` when unusable."""
+    base = _safe_stem(name)
+    return f"{base}{RECIPE_EXT}" if base else ""
 
 
 def _unique_path(directory: str, filename: str) -> str:
@@ -348,6 +365,42 @@ def _unique_path(directory: str, filename: str) -> str:
         suffix += 1
 
 
+def _write_recipe(directory: str, name: str, recipe: dict) -> str | None:
+    """Write the sidecar atomically beside the `.mix`; an error tag or None."""
+    filename = safe_recipe_filename(name)
+    if not filename:
+        return "bad_recipe"
+    try:
+        text = json.dumps(recipe, ensure_ascii=False, indent=2)
+    except (TypeError, ValueError):
+        return "bad_recipe"
+    if len(text.encode("utf-8")) > MAX_RECIPE_BYTES:
+        return "bad_recipe"
+    path = os.path.join(directory, filename)
+    try:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        return "unwritable"
+    return None
+
+
+def read_recipe(directory: str, session_filename: str) -> dict | None:
+    """The recipe stored beside one `.mix`, or None (absent/corrupt/not an object)."""
+    stem = str(session_filename)
+    if stem.endswith(SESSION_EXT):
+        stem = stem[: -len(SESSION_EXT)]
+    path = os.path.join(directory, f"{stem}{RECIPE_EXT}")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
 def write_session(
     directory: str,
     name: str,
@@ -355,16 +408,20 @@ def write_session(
     *,
     overwrite: bool = False,
     alphas: dict[str, float] | None = None,
+    recipe: dict | None = None,
 ) -> tuple[dict | None, str | None]:
     """Write a `.mix` from a file list; ``(result, None)`` or ``(None, error)``.
 
     ``overwrite`` (e44s02) writes the exact ``safe_session_filename(name)`` path,
     replacing an existing file; the default keeps the deterministic ``_2``
-    suffix, so older clients are unaffected.
+    suffix, so older clients are unaffected. ``recipe`` (e100s01) is stored
+    opaquely as ``<same stem>.vjmix.json`` after a successful `.mix` write: the
+    session stays loadable when only the sidecar fails, and the error reports it.
 
     Errors: ``bad_name``, ``no_files``, ``missing_file`` (re-checked here: a file
     deleted between composing and committing must be reported, not silently
-    written), ``unwritable``. The write is atomic (temp + rename).
+    written), ``bad_recipe``, ``unwritable``. Each write is atomic (temp +
+    rename).
     """
     filename = safe_session_filename(name)
     if not filename:
@@ -387,6 +444,10 @@ def write_session(
         os.replace(tmp, path)
     except OSError:
         return None, "unwritable"
+    if recipe is not None:
+        error = _write_recipe(directory, os.path.basename(path)[: -len(SESSION_EXT)], recipe)
+        if error is not None:
+            return None, error
     return (
         {
             "file": path,
@@ -422,6 +483,7 @@ def list_sessions(directory: str) -> list[dict]:
                 "name": entry[: -len(SESSION_EXT)],
                 "mtime": mtime,
                 "sources": parse_sources(text),
+                "recipe": read_recipe(directory, entry),
             }
         )
     return sessions

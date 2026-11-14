@@ -115,13 +115,13 @@ def test_global_failures_outside_the_window_do_not_regenerate():
 # ---------------------------------------------------------------------------
 
 
-def test_abuse_config_defaults_and_visibility():
-    assert config.DEFAULTS["pairing_lock_after"] == 5
-    assert config.DEFAULTS["pairing_lock_seconds"] == 60
-    assert config.DEFAULTS["pairing_global_lock_after"] == 20
+def test_abuse_policy_is_fixed_not_config():
+    """2026-11-14: the lock policy is a constant; no config key weakens it."""
+    assert viosc.PAIRING_LOCK_AFTER == 5
+    assert viosc.PAIRING_LOCK_SECONDS == 60
+    assert viosc.PAIRING_GLOBAL_LOCK_AFTER == 20
     for key in ("pairing_lock_after", "pairing_lock_seconds", "pairing_global_lock_after"):
-        assert key in config.FIELD_SPEC
-        assert hasattr(viosc, config.daemon_attr(key))
+        assert key not in config.FIELD_SPEC
 
 
 def test_code_rotation_across_starts(monkeypatch):
@@ -150,10 +150,10 @@ def test_daemon_keeps_pairing_code_in_sync_on_regeneration(monkeypatch):
             pass
 
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
-    values, _, _ = config.effective({"pairing_global_lock_after": 3})
+    values, _, _ = config.effective({}, {})
     viosc.boot(values)
     before = viosc.PAIRING_CODE
-    for i in range(3):
+    for i in range(viosc.PAIRING_GLOBAL_LOCK_AFTER):
         viosc.PAIRING_GATE.authenticate("0000", f"10.0.0.{i}")
     assert before != viosc.PAIRING_CODE
     assert viosc.PAIRING_GATE.code == viosc.PAIRING_CODE

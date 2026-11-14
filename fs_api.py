@@ -36,6 +36,9 @@ MEDIA_OTHER = "other"
 
 # Listings are paged so a huge directory cannot produce an unbounded response.
 DEFAULT_PAGE_SIZE = 500
+# e100s01: a folder scan is bounded too, and it says when it stopped early, so a
+# deep media tree can never turn one request into an unbounded walk.
+MAX_SCAN_FILES = 2000
 
 
 def classify(name: str) -> str:
@@ -119,6 +122,22 @@ def _entry(directory: str, name: str) -> dict:
     return entry
 
 
+def resolve_directory(path: str, roots: list[str]) -> tuple[str | None, str | None]:
+    """The real path of a directory inside a root, or ``(None, tag)``.
+
+    One place for the containment + existence + kind triple so the listing, the
+    scan (e100s01) and the session writer's target directory cannot drift.
+    """
+    real = resolve_within_roots(path, roots)
+    if real is None:
+        return None, "forbidden"
+    if not os.path.exists(real):
+        return None, "not_found"
+    if not os.path.isdir(real):
+        return None, "not_dir"
+    return real, None
+
+
 def list_directory(
     path: str,
     roots: list[str],
@@ -133,13 +152,9 @@ def list_directory(
     ``unreadable``. Entries are directories-first then case-insensitive by name,
     so paging is stable across requests.
     """
-    directory = resolve_within_roots(path, roots)
+    directory, error = resolve_directory(path, roots)
     if directory is None:
-        return None, "forbidden"
-    if not os.path.exists(directory):
-        return None, "not_found"
-    if not os.path.isdir(directory):
-        return None, "not_dir"
+        return None, error
     try:
         names = os.listdir(directory)
     except OSError:
@@ -159,6 +174,102 @@ def list_directory(
             "total": total,
             "offset": start,
             "page_size": size,
+        },
+        None,
+    )
+
+
+def _scan_entry(full: str, name: str) -> dict:
+    """One scanned video: path, name, size and mtime (a stat failure keeps 0s)."""
+    entry: dict = {"path": full, "name": name, "size": 0, "mtime": 0.0}
+    try:
+        stat = os.stat(full)
+    except OSError:
+        return entry
+    entry["size"] = stat.st_size
+    entry["mtime"] = stat.st_mtime
+    return entry
+
+
+def _collect_videos(
+    directory: str,
+    roots: list[str],
+    *,
+    recursive: bool,
+    show_hidden: bool,
+    limit: int,
+) -> tuple[list[dict], int, bool]:
+    """Bounded breadth-first walk of the VIDEO files.
+
+    Returns ``(files, ignored, truncated)`` — the non-video count is what the
+    wizard reports as "other entries ignored".
+
+    Every directory entered is re-checked against the roots, so a symlink that
+    points outside is skipped instead of walked. The cap is checked RIGHT BEFORE
+    appending a video, so a folder with exactly ``limit`` clips is not called
+    truncated.
+    """
+    found: list[dict] = []
+    ignored = 0
+    pending = [directory]
+    truncated = False
+    while pending and not truncated:
+        current = pending.pop(0)
+        try:
+            names = sorted(os.listdir(current))
+        except OSError:
+            continue
+        for name in names:
+            if not show_hidden and name.startswith("."):
+                continue
+            full = os.path.join(current, name)
+            if os.path.isdir(full):
+                if recursive:
+                    inside = resolve_within_roots(full, roots)
+                    if inside is not None:
+                        pending.append(inside)
+                continue
+            if classify(name) != MEDIA_VIDEO:
+                ignored += 1
+                continue
+            if len(found) >= limit:
+                truncated = True
+                break
+            found.append(_scan_entry(full, name))
+    return found, ignored, truncated
+
+
+def scan_videos(
+    path: str,
+    roots: list[str],
+    *,
+    recursive: bool = False,
+    show_hidden: bool = False,
+    max_files: int = MAX_SCAN_FILES,
+) -> tuple[dict | None, str | None]:
+    """The video files of a folder tree: ``(payload, error)`` (e100s01).
+
+    Errors are the listing's own tags (``forbidden``, ``not_found``, ``not_dir``,
+    ``unreadable``), so the wizard words them exactly like the browser does.
+    ``truncated`` says the walk stopped at the cap, and ``total`` is then a lower
+    bound, never a claim about the folder. ``ignored`` counts the non-video files
+    the walk skipped, so the wizard can say what it left out.
+    """
+    directory, error = resolve_directory(path, roots)
+    if directory is None:
+        return None, error
+    found, ignored, truncated = _collect_videos(
+        directory, roots, recursive=recursive, show_hidden=show_hidden, limit=max(1, max_files)
+    )
+    found.sort(key=lambda entry: entry["name"].lower())
+    return (
+        {
+            "path": directory,
+            "files": found,
+            "total": len(found),
+            "ignored": ignored,
+            "truncated": truncated,
+            "recursive": bool(recursive),
         },
         None,
     )

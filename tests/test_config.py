@@ -38,12 +38,12 @@ def test_defaults_mirror_daemon_ports():
 def test_defaults_mirror_daemon_knobs_and_paths():
     assert config.DEFAULTS["ffmpeg_path"] == "ffmpeg"
     assert config.DEFAULTS["ffprobe_path"] == "ffprobe"
-    assert config.DEFAULTS["log_level"] == 1
     assert config.DEFAULTS["sync_interval_ms"] == 2000
-    assert config.DEFAULTS["prune_delay_sec"] == 0.5
     assert "monitor_max_misses" not in config.DEFAULTS
-    assert config.DEFAULTS["thumb_max_concurrency"] == 3
     assert config.DEFAULTS["thumb_max_count"] == 3
+    # 2026-11-14: these are fixed policy/timing now, not settings.
+    for retired in ("log_level", "prune_delay_sec", "thumb_max_concurrency"):
+        assert retired not in config.DEFAULTS
 
 
 def test_field_spec_covers_apply_groups_and_env_map():
@@ -110,9 +110,8 @@ def test_validate_reports_bad_ports_levels_and_intervals():
     assert config.validate({"from_vimix_port": 0})
     assert config.validate({"from_vimix_port": 70000})
     assert config.validate({"http_port": -1})
-    assert config.validate({"log_level": 2})
+    assert config.validate({"pairing_code_length": 0})
     assert config.validate({"sync_interval_ms": 50})
-    assert config.validate({"thumb_max_concurrency": 0})
     assert config.validate({"thumb_max_count": "many"})
     assert config.validate({"tovimix_ip": ""})
 
@@ -150,14 +149,14 @@ def test_malformed_json_warns_and_keeps_defaults(tmp_path):
 
 def test_save_round_trips_and_creates_directory(tmp_path):
     target = tmp_path / "deep" / "dir" / "config.json"
-    overrides = dict(config.DEFAULTS, tovimix_ip="192.168.1.50", log_level=0)
+    overrides = dict(config.DEFAULTS, tovimix_ip="192.168.1.50", thumb_max_count=5)
 
     config.save(str(target), overrides)
 
     values, sources, _ = config.load_effective(str(target))
     assert values["tovimix_ip"] == "192.168.1.50"
     assert sources["tovimix_ip"] == "json"
-    assert values["log_level"] == 0
+    assert values["thumb_max_count"] == 5
 
 
 def test_save_is_atomic_no_stray_temp_files(tmp_path):
@@ -188,15 +187,15 @@ def test_parse_form_types_strings_and_keeps_unspecified_defaults():
         {
             "tovimix_ip": "10.0.0.9",
             "tovimix_port": "6699",
-            "prune_delay_sec": "1.5",
-            "log_level": "0",
+            "thumb_max_count": "5",
+            "sync_interval_ms": "500",
         }
     )
     assert problems == []
     assert values["tovimix_ip"] == "10.0.0.9"
     assert values["tovimix_port"] == 6699
-    assert values["prune_delay_sec"] == 1.5
-    assert values["log_level"] == 0
+    assert values["thumb_max_count"] == 5
+    assert values["sync_interval_ms"] == 500
     assert values["from_vimix_port"] == 7001, "unspecified keys keep the default"
 
 
@@ -207,10 +206,10 @@ def test_parse_form_empty_entries_use_defaults():
 
 
 def test_parse_form_reports_invalid_and_falls_back_per_key():
-    values, problems = config.parse_form({"from_vimix_port": "70000", "log_level": "2"})
+    values, problems = config.parse_form({"from_vimix_port": "70000", "pairing_code_length": "0"})
     assert len(problems) == 2
     assert values["from_vimix_port"] == 7001
-    assert values["log_level"] == 1
+    assert values["pairing_code_length"] == 4
 
 
 # ---------------------------------------------------------------------------
@@ -221,17 +220,13 @@ def test_parse_form_reports_invalid_and_falls_back_per_key():
 def test_visibility_tiers_cover_every_field():
     assert set(config.VISIBILITY) == set(config.FIELD_SPEC)
     assert set(config.VISIBILITY.values()) == {"essential", "advanced", "hidden"}
-    assert config.essential_fields() == [
-        "http_port",
-        "pairing_enabled",
-    ]
+    assert config.essential_fields() == ["http_port"]
     assert config.advanced_fields() == [
         "http_ip",
         "sync_interval_ms",
         "thumb_max_count",
         "pairing_code_length",
         "pairing_code_ttl_hours",
-        "pairing_trusted_peers",
         "fs_roots",
         "fs_show_hidden",
         "fs_sessions_dir",
@@ -247,13 +242,6 @@ def test_visibility_hides_auto_and_internal_fields():
         "tovimix_port",
         "ffmpeg_path",
         "ffprobe_path",
-        "log_level",
-        "prune_delay_sec",
-        "thumb_max_concurrency",
-        "pairing_lease_seconds",
-        "pairing_lock_after",
-        "pairing_lock_seconds",
-        "pairing_global_lock_after",
         "pairing_code",
         "pairing_code_created_at",
         "fs_page_size",
@@ -261,12 +249,12 @@ def test_visibility_hides_auto_and_internal_fields():
 
 
 def test_parse_form_base_preserves_hidden_fields():
-    base = dict(config.DEFAULTS, thumb_max_concurrency=7, tovimix_ip="10.0.0.9")
+    base = dict(config.DEFAULTS, fs_page_size=900, tovimix_ip="10.0.0.9")
 
     values, problems = config.parse_form({"tovimix_ip": "10.1.1.1"}, base=base)
 
     assert problems == []
-    assert values["thumb_max_concurrency"] == 7, "hidden fields keep their current value"
+    assert values["fs_page_size"] == 900, "hidden fields keep their current value"
     assert values["sync_interval_ms"] == 2000
     assert values["tovimix_ip"] == "10.1.1.1"
 
@@ -321,3 +309,47 @@ def test_hidden_field_still_honoured_from_json(tmp_path):
     cfg_path.write_text(json.dumps({"from_vimix_port": 7100}))
     values, _, _ = config.load_effective(str(cfg_path))
     assert values["from_vimix_port"] == 7100
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-14 — the retired internal/security knobs
+# ---------------------------------------------------------------------------
+
+RETIRED_2026_11 = (
+    "pairing_enabled",
+    "pairing_trusted_peers",
+    "pairing_lease_seconds",
+    "pairing_lock_after",
+    "pairing_lock_seconds",
+    "pairing_global_lock_after",
+    "log_level",
+    "prune_delay_sec",
+    "thumb_max_concurrency",
+)
+
+
+def test_retired_knobs_are_dropped_silently_and_stripped_on_save(tmp_path):
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps(
+            {
+                **dict.fromkeys(RETIRED_2026_11, 1),
+                "pairing_trusted_peers": ["10.0.0.5"],
+                "sync_interval_ms": 500,
+            }
+        )
+    )
+
+    values, _sources, warnings = config.load_effective(str(path))
+
+    # One aggregated line, never one warning per old key.
+    assert len(warnings) == 1 and "dropped retired field" in warnings[0]
+    for key in RETIRED_2026_11:
+        assert key not in values
+    assert values["sync_interval_ms"] == 500
+
+    config.merge_save(str(path), {"http_port": 8686})
+    written = json.loads(path.read_text())
+    for key in RETIRED_2026_11:
+        assert key not in written, f"{key} must not survive a save"
+    assert written["http_port"] == 8686

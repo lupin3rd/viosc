@@ -8,6 +8,7 @@ default behaviour (the legacy 25 tests prove that).
 Headless: no servers started, no display, monkeypatched clients.
 """
 
+import errno
 import json
 import os
 import sys
@@ -47,7 +48,6 @@ def test_boot_applies_live_fields_to_module_state(monkeypatch):
     values = make_values(
         tovimix_ip="10.0.0.9",
         tovimix_port=6699,
-        log_level=0,
         sync_interval_ms=500,
         ffmpeg_path="/opt/bin/ffmpeg",
         thumb_max_count=2,
@@ -57,7 +57,6 @@ def test_boot_applies_live_fields_to_module_state(monkeypatch):
 
     assert viosc.TOVIMIX_IP == "10.0.0.9"
     assert viosc.TOVIMIX_PORT == 6699
-    assert viosc.LOG_LEVEL == 0
     assert viosc.sync_interval_time == 500
     assert viosc.FFMPEG_PATH == "/opt/bin/ffmpeg"
     assert viosc.THUMB_MAX_COUNT == 2
@@ -79,22 +78,22 @@ def test_boot_applies_restart_fields_to_module_state(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# e01s02t2 — RED: thumbnail semaphore rebuilt from config
+# e01s02t2 — the thumbnail semaphore is built at boot from the fixed bound
 # ---------------------------------------------------------------------------
 
 
-def test_boot_rebuilds_thumb_semaphore(monkeypatch):
+def test_boot_builds_the_fixed_thumb_semaphore(monkeypatch):
     monkeypatch.setattr(viosc, "SimpleUDPClient", FakeClient)
 
-    viosc.boot(make_values(thumb_max_concurrency=5))
+    viosc.boot(config.effective({}, {})[0])
 
     acquired = []
-    for _ in range(5):
+    for _ in range(viosc.THUMB_MAX_CONCURRENCY):
         acquired.append(viosc.thumb_semaphore.acquire(blocking=False))
-    sixth = viosc.thumb_semaphore.acquire(blocking=False)
+    extra = viosc.thumb_semaphore.acquire(blocking=False)
     for _ in acquired:
         viosc.thumb_semaphore.release()
-    assert all(acquired) and not sixth
+    assert all(acquired) and not extra
 
 
 # ---------------------------------------------------------------------------
@@ -190,3 +189,18 @@ def test_every_config_key_maps_to_a_daemon_attribute():
     for key in config.FIELD_SPEC:
         attr = config.daemon_attr(key)
         assert hasattr(viosc, attr), f"config key '{key}' -> daemon attr '{attr}' missing"
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-14 — a short UI reason for a failed HTTP bind
+# ---------------------------------------------------------------------------
+
+
+def test_bind_error_text_summarizes_a_busy_port():
+    busy = OSError(errno.EADDRINUSE, "Address already in use")
+    assert viosc.bind_error_text(busy, "0.0.0.0", 8686) == "port 8686 in use"
+
+
+def test_bind_error_text_falls_back_to_the_address():
+    other = OSError(errno.EACCES, "Permission denied")
+    assert viosc.bind_error_text(other, "0.0.0.0", 8686) == "bind 0.0.0.0:8686 failed"

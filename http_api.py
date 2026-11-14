@@ -591,11 +591,24 @@ def make_preview_handler(
             if route == "/fs/roots":
                 self._send_json(200, fs.roots())
                 return
-            if route == "/fs/sessions":
-                self._send_json(200, fs.sessions())
-                return
             params = parse_qs(parsed.query)
+            if route == "/fs/sessions":
+                directory = (params.get("dir") or [""])[0]
+                sessions, error = fs.sessions(directory)
+                if sessions is None:
+                    self._send_fs_error(error)
+                    return
+                self._send_json(200, sessions)
+                return
             path = (params.get("path") or [""])[0]
+            if route == "/fs/scan":
+                recursive = (params.get("recursive") or ["0"])[0] in ("1", "true", "yes")
+                payload, error = fs.scan(path, recursive)
+                if payload is None:
+                    self._send_fs_error(error)
+                    return
+                self._send_json(200, payload)
+                return
             if route == "/fs/list":
                 try:
                     offset = int((params.get("offset") or ["0"])[0])
@@ -647,6 +660,12 @@ def make_preview_handler(
                 alphas = payload.get("alphas")
                 if alphas is not None and not isinstance(alphas, dict):
                     raise ValueError("alphas must be an object")
+                directory = payload.get("dir")
+                if directory is not None and not isinstance(directory, str):
+                    raise ValueError("dir must be a string")
+                recipe = payload.get("recipe")
+                if recipe is not None and not isinstance(recipe, dict):
+                    raise ValueError("recipe must be an object")
             except (ValueError, AttributeError, TypeError):
                 self._send_json(400, {"error": "invalid JSON body"})
                 return
@@ -655,12 +674,18 @@ def make_preview_handler(
                 [str(item) for item in files],
                 overwrite=overwrite,
                 alphas=alphas,
+                directory=directory or "",
+                recipe=recipe,
             )
             if result is None:
                 status = {
                     "bad_name": 400,
                     "no_files": 400,
                     "missing_file": 409,
+                    "bad_recipe": 400,
+                    "forbidden": 403,
+                    "not_found": 404,
+                    "not_dir": 400,
                     "unwritable": 500,
                 }.get(error, 400)
                 self._send_json(status, {"error": error or "error"})
