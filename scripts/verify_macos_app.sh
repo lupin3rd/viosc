@@ -86,8 +86,6 @@ with open(path, "w", encoding="utf-8") as handle:
             "from_vimix_port": from_vimix,
             "http_ip": "127.0.0.1",
             "http_port": http_port,
-            "pairing_enabled": False,
-            "log_level": 1,
         },
         handle,
     )
@@ -101,19 +99,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Pairing is always on (2026-11-14), so the unauthenticated smoke proves the
+# surface is UP with a 401 (the gate answers) or 200 when it is bypassed; the
+# SDK state payload itself is covered by the test suite.
 status="000"
 for _ in $(seq 1 40); do
     status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/state" || true)"
-    [ "$status" = "200" ] && break
+    case "$status" in 200|401) break ;; esac
     sleep 0.25
 done
-if [ "$status" != "200" ]; then
-    echo "ERROR: /state answered $status" >&2
-    tail -30 "$LOG" >&2
-    exit 1
-fi
+case "$status" in
+    200|401) ;;
+    *)
+        echo "ERROR: the HTTP surface answered $status" >&2
+        tail -30 "$LOG" >&2
+        exit 1
+        ;;
+esac
 if [ -s "$LOG" ] && ! grep -q "Contents/Resources/bin/ffmpeg" "$LOG"; then
     echo "WARNING: the headless log did not show the bundled ffmpeg path." >&2
     echo "         (a --windowed bundle may have no stdout; the layout check covers it.)" >&2
 fi
-echo "==> PASS: layout, $EXPECTED_ARCH, bundled ffmpeg, /state 200"
+echo "==> PASS: layout, $EXPECTED_ARCH, bundled ffmpeg, HTTP surface up ($status)"

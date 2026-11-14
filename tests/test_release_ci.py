@@ -62,10 +62,10 @@ def test_release_job_is_version_agnostic() -> None:
 def test_macos_verifier_reports_and_checks_expected_arch() -> None:
     text = (ROOT / "scripts" / "verify_macos_app.sh").read_text(encoding="utf-8")
 
-    assert "PASS: layout, $EXPECTED_ARCH, bundled ffmpeg, /state 200" in text
+    assert "PASS: layout, $EXPECTED_ARCH, bundled ffmpeg, HTTP surface up" in text
     assert 'find "$APP" -type f -exec file {} +' in text
     assert 'grep -v "$EXPECTED_ARCH"' in text
-    assert "PASS: layout, arm64, bundled ffmpeg, /state 200" not in text
+    assert "PASS: layout, arm64, bundled ffmpeg, HTTP surface up" not in text
 
 
 def test_docs_do_not_claim_arm64_is_a_cross_build() -> None:
